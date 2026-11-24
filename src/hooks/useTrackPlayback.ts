@@ -46,8 +46,9 @@ export function useTrackPlayback(track: Track | null) {
   }, [isPlaying])
 
   const durationMs = isCurrent && snapshot.durationMs > 0 ? snapshot.durationMs : (track?.durationMs ?? 0)
+  // A song that hasn't started yet shows the point it will start from.
   const positionMs = !isCurrent
-    ? 0
+    ? start
     : Math.min(durationMs, snapshot.positionMs + (isPlaying ? Math.max(0, now - snapshot.updatedAt) : 0))
 
   /** Call from a user gesture (swipe, button) to allow audio from now on. */
@@ -97,6 +98,8 @@ export function useTrackPlayback(track: Track | null) {
 
   return {
     availability: snapshot.availability,
+    /** The current song was started (it may be paused since). */
+    hasStarted: isCurrent,
     isPlaying,
     positionMs,
     durationMs,

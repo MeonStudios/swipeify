@@ -79,7 +79,7 @@ export default function Swipe() {
   const peek = ready ? nextTrack(state) : null
   const complete = ready && isComplete(state)
   const justFinished = complete && swipedThisVisit
-  const { availability, isPlaying, positionMs, durationMs, volume, unlock, toggle, replay, seekTo, seekBy, setVolume } =
+  const { availability, hasStarted, isPlaying, positionMs, durationMs, volume, unlock, toggle, replay, seekTo, seekBy, setVolume } =
     useTrackPlayback(track)
 
   const decide = useCallback(
@@ -207,6 +207,7 @@ export default function Swipe() {
             {!complete && (
               <MusicPlayer
                 availability={availability}
+                hasStarted={hasStarted}
                 isPlaying={isPlaying}
                 positionMs={positionMs}
                 durationMs={durationMs}

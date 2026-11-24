@@ -4,6 +4,8 @@ import type { PlaybackAvailability } from '../services/spotify/playback'
 
 interface MusicPlayerProps {
   availability: PlaybackAvailability
+  /** The song was started at least once; before that the position is where it will start. */
+  hasStarted: boolean
   isPlaying: boolean
   positionMs: number
   durationMs: number
@@ -43,6 +45,7 @@ const releaseFocus = (event: PointerEvent<HTMLInputElement>) => event.currentTar
 
 export function MusicPlayer({
   availability,
+  hasStarted,
   isPlaying,
   positionMs,
   durationMs,
@@ -84,7 +87,7 @@ export function MusicPlayer({
   const pct = durationMs > 0 ? Math.min(100, (shownMs / durationMs) * 100) : 0
   const status = connecting
     ? 'Connecting to Spotify…'
-    : isPlaying || positionMs > 0
+    : isPlaying || hasStarted
       ? 'Playing in Swipeify'
       : 'Tap play to listen'
 
