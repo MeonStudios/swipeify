@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { createPlaybackController, PLAY_DEBOUNCE_MS } from './playback'
+import { createPlaybackController, DEVICE_RETRY_DELAYS_MS, MUTE_TIMEOUT_MS, PLAY_DEBOUNCE_MS } from './playback'
 
 type Listener = (arg: unknown) => void
 
@@ -166,7 +166,7 @@ describe('playback controller recovery', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
 
-  it('reconnects and retries when Spotify no longer knows the device', async () => {
+  it('retries on the same device first when Spotify does not know it yet', async () => {
     const { controller, request, playedUris } = await setup()
     const first = FakePlayer.last
     const { SpotifyApiError } = await import('./client')
@@ -174,11 +174,43 @@ describe('playback controller recovery', () => {
 
     controller.play('spotify:track:a', 1000)
     await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
-    await vi.advanceTimersByTimeAsync(0)
+    expect(playedUris()).toEqual(['spotify:track:a'])
 
-    expect(FakePlayer.last).not.toBe(first)
-    expect(controller.getSnapshot().availability).toBe('ready')
+    await vi.advanceTimersByTimeAsync(DEVICE_RETRY_DELAYS_MS[0])
+    expect(FakePlayer.last).toBe(first)
     expect(playedUris()).toEqual(['spotify:track:a', 'spotify:track:a'])
+    expect(controller.getSnapshot().availability).toBe('ready')
+  })
+
+  it('reconnects once if the device stays unknown, then gives up instead of looping', async () => {
+    vi.spyOn(console, 'warn').mockImplementation(() => {})
+    const { controller, request } = await setup()
+    const { SpotifyApiError } = await import('./client')
+    request.mockRejectedValue(new SpotifyApiError(404, 'Device not found'))
+    const created = FakePlayer.created
+
+    controller.play('spotify:track:a', 1000)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS + DEVICE_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0))
+
+    expect(FakePlayer.created).toBe(created + 1)
+    expect(request).toHaveBeenCalledTimes(DEVICE_RETRY_DELAYS_MS.length + 1)
+    expect(controller.getSnapshot().availability).toBe('error')
+
+    await vi.advanceTimersByTimeAsync(60_000)
+    expect(request).toHaveBeenCalledTimes(DEVICE_RETRY_DELAYS_MS.length + 1)
+    expect(FakePlayer.created).toBe(created + 1)
+  })
+
+  it('a newer song requested during a retry wait is sent instead', async () => {
+    const { controller, request, playedUris } = await setup()
+    const { SpotifyApiError } = await import('./client')
+    request.mockRejectedValueOnce(new SpotifyApiError(404, 'Device not found'))
+
+    controller.play('spotify:track:a', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    controller.play('spotify:track:b', 0)
+    await vi.advanceTimersByTimeAsync(DEVICE_RETRY_DELAYS_MS[0])
+    expect(playedUris()).toEqual(['spotify:track:a', 'spotify:track:b'])
   })
 
   it('shows connecting while the SDK reports not_ready and recovers on ready', async () => {
@@ -187,6 +219,68 @@ describe('playback controller recovery', () => {
     expect(controller.getSnapshot().availability).toBe('connecting')
     player.emit('ready', { device_id: 'dev-2' })
     expect(controller.getSnapshot().availability).toBe('ready')
+  })
+})
+
+/** Plays a and lets the player report it, like a song that is already playing. */
+async function playingA() {
+  const ctx = await setup()
+  ctx.controller.play('spotify:track:a', 0)
+  await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+  ctx.player.emit('player_state_changed', state('spotify:track:a', 1000))
+  ctx.player.calls.length = 0
+  return ctx
+}
+
+describe('playback controller switching songs', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('mutes the previous song instead of pausing it, and unmutes once the next one loads', async () => {
+    const { controller, player } = await playingA()
+    controller.play('spotify:track:b', 60_000)
+    controller.play('spotify:track:c', 60_000)
+    expect(player.calls).toEqual(['volume:0'])
+
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    player.emit('player_state_changed', state('spotify:track:c', 60_000))
+    expect(player.calls).toEqual(['volume:0', 'volume:0.8'])
+    expect(player.pause).not.toHaveBeenCalled()
+  })
+
+  it('stays muted while a song the user already swiped past loads', async () => {
+    const { controller, player } = await playingA()
+    controller.play('spotify:track:b', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    controller.play('spotify:track:c', 0)
+    player.emit('player_state_changed', state('spotify:track:b', 0))
+    expect(player.calls).toEqual(['volume:0'])
+  })
+
+  it('a volume change while muted applies once the next song plays', async () => {
+    const { controller, player } = await playingA()
+    controller.play('spotify:track:b', 0)
+    controller.setVolume(0.3)
+    expect(player.calls).toEqual(['volume:0'])
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    player.emit('player_state_changed', state('spotify:track:b', 0))
+    expect(player.calls).toEqual(['volume:0', 'volume:0.3'])
+  })
+
+  it('pausing before the next song starts stops the old one and restores the volume', async () => {
+    const { controller, player, request } = await playingA()
+    controller.play('spotify:track:b', 0)
+    controller.toggle('spotify:track:b', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    expect(player.calls).toEqual(['volume:0', 'pause', 'volume:0.8'])
+    expect(request).toHaveBeenCalledTimes(1)
+  })
+
+  it('stops the muted old song if the next one never loads', async () => {
+    const { controller, player } = await playingA()
+    controller.play('spotify:track:b', 0)
+    await vi.advanceTimersByTimeAsync(MUTE_TIMEOUT_MS)
+    expect(player.calls).toEqual(['volume:0', 'pause', 'volume:0.8'])
   })
 })
 

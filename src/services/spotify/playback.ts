@@ -4,6 +4,9 @@
 // Fast swiping produces bursts of "play" requests. Overlapping requests can
 // leave the SDK paused or on the wrong position, so only the latest request
 // is sent, one at a time, and player events for other tracks are ignored.
+// The previous song is muted, not paused, while the next one loads: Spotify
+// accepts a play request before the device has loaded the song, so a pause
+// could arrive after the new song started and stop it.
 //
 // Framework-agnostic: React subscribes via `subscribe`/`getSnapshot`.
 
@@ -15,6 +18,16 @@ const READY_TIMEOUT_MS = 12_000
 /** Wait this long after a play request; a newer one (fast swiping) replaces it. */
 export const PLAY_DEBOUNCE_MS = 150
 const DEFAULT_VOLUME = 0.8
+/** If the next song still hasn't loaded after this long, stop the muted previous one. */
+export const MUTE_TIMEOUT_MS = 8000
+/**
+ * Waits before each retry when Spotify answers 404 ("device not found"). A
+ * freshly connected device can take a moment before the Web API knows it, so
+ * reconnecting right away would only make a new unknown device, again and again.
+ */
+export const DEVICE_RETRY_DELAYS_MS = [500, 1000, 2000, 4000]
+/** At this retry the player reconnects instead of waiting for the same device. */
+const RECONNECT_AT_RETRY = 2
 
 const clampVolume = (volume: number) => (Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : DEFAULT_VOLUME)
 
@@ -110,6 +123,15 @@ if (import.meta.hot) import.meta.hot.accept(() => window.location.reload())
 
 const isDesktopBrowser = () => !/Android|iPhone|iPad|iPod|Mobile/i.test(navigator.userAgent)
 
+interface PlayRequest {
+  uri: string
+  positionMs: number
+  /** How often Spotify already answered 404 for this request. */
+  deviceRetries?: number
+}
+
+const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
 export function createPlaybackController(config: PlaybackConfig): PlaybackController {
   const loadPlayerClass = config.loadPlayerClass ?? loadSdkPlayerClass
   const isSupportedBrowser = config.isSupportedBrowser ?? isDesktopBrowser
@@ -124,9 +146,12 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
   /** Track the SDK reports as loaded (after relinking is resolved to what we asked for). */
   let loadedUri: string | null = null
   /** Latest play request not yet sent to Spotify. */
-  let pending: { uri: string; positionMs: number } | null = null
+  let pending: PlayRequest | null = null
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
   let sending = false
+  /** The previous song is muted while the next one loads (see the note at the top). */
+  let muted = false
+  let muteTimer: ReturnType<typeof setTimeout> | null = null
   /**
    * Bumped by `disconnect()`. Async work started before a disconnect (a play
    * request in flight, a 404 retry) checks it and stops instead of touching
@@ -141,7 +166,37 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     listeners.forEach((listener) => listener())
   }
 
+  function mute() {
+    if (muteTimer) clearTimeout(muteTimer)
+    muteTimer = setTimeout(() => {
+      muteTimer = null
+      // The next song never came: stop the old one, then make the volume normal again.
+      if (muted) stopAndUnmute()
+    }, MUTE_TIMEOUT_MS)
+    if (muted) return
+    muted = true
+    player?.setVolume(0).catch(() => {})
+  }
+
+  function unmute() {
+    if (muteTimer) clearTimeout(muteTimer)
+    muteTimer = null
+    if (!muted) return
+    muted = false
+    player?.setVolume(snapshot.volume).catch(() => {})
+  }
+
+  /** Pauses whatever is playing; only safe when no play request follows. */
+  function stopAndUnmute() {
+    const current = player
+    if (!current || !muted) return unmute()
+    current.pause().catch(() => {}).finally(() => {
+      if (player === current) unmute()
+    })
+  }
+
   function fail(availability: PlaybackAvailability) {
+    unmute()
     update({ availability, isPlaying: false })
     pending = null
     const waiters = readyWaiters
@@ -161,6 +216,8 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     player = null
     deviceId = null
     loadedUri = null
+    // The new player starts at the normal volume.
+    muted = false
     update({ availability: 'connecting', isPlaying: false })
     void connect()
   }
@@ -172,7 +229,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     const mySession = session
     try {
       while (pending) {
-        const request = pending
+        const request: PlayRequest = pending
         pending = null
         try {
           await whenReady()
@@ -188,12 +245,30 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
           if (mySession !== session) return
           if (error instanceof SpotifyApiError && error.status === 403) fail('premium-required')
           else if (error instanceof SpotifyApiError && error.status === 404) {
-            // Spotify no longer knows our device: reconnect and retry unless a newer song was requested.
-            pending ??= request
-            reconnect()
+            // Spotify doesn't know our device (yet, or any more). Retry a few times, unless a newer song was requested.
+            const retries = request.deviceRetries ?? 0
+            if (retries >= DEVICE_RETRY_DELAYS_MS.length) {
+              console.warn('[playback] Spotify keeps answering "device not found"; giving up')
+              fail('error')
+              return
+            }
+            const retry: PlayRequest = { ...request, deviceRetries: retries + 1 }
+            if (retries === RECONNECT_AT_RETRY) {
+              console.warn('[playback] Spotify does not know this device; reconnecting')
+              pending ??= retry
+              reconnect()
+              return
+            }
+            await wait(DEVICE_RETRY_DELAYS_MS[retries])
+            if (mySession !== session) return
+            pending ??= retry
+          } else if (error instanceof SpotifyApiError) {
+            console.warn('[playback]', error.message)
+            if (!pending) stopAndUnmute()
+          } else {
+            if (!pending) stopAndUnmute()
             return
-          } else if (error instanceof SpotifyApiError) console.warn('[playback]', error.message)
-          else return
+          }
         }
       }
     } finally {
@@ -205,7 +280,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
   function play(uri: string, positionMs: number) {
     pending = { uri, positionMs }
     // Silence the previous song right away instead of after the debounce.
-    if (loadedUri && loadedUri !== uri) player?.pause().catch(() => {})
+    if (loadedUri && loadedUri !== uri) mute()
     // Until the player reports the new track, nothing is playing for it.
     update({ activeUri: uri, isPlaying: false, positionMs, durationMs: 0, updatedAt: Date.now() })
     if (debounceTimer) clearTimeout(debounceTimer)
@@ -228,6 +303,8 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     loadedUri = snapshot.activeUri && reported.includes(snapshot.activeUri) ? snapshot.activeUri : (current?.uri ?? null)
     // Late events for a previous track must not look like the current one playing.
     if (loadedUri !== snapshot.activeUri) return
+    // The new song has loaded: let it be heard.
+    if (!pending) unmute()
     update({
       isPlaying: !state.paused,
       positionMs: state.position,
@@ -328,6 +405,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
         // Pressed pause before the song even started: cancel it.
         pending = null
         if (debounceTimer) clearTimeout(debounceTimer)
+        if (!sending) stopAndUnmute()
         return
       }
       if (isLoaded(uri)) player?.togglePlay().catch(() => {})
@@ -352,13 +430,15 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
       const next = clampVolume(volume)
       if (next === snapshot.volume) return
       update({ volume: next })
-      player?.setVolume(next).catch(() => {})
+      // While muted, the new volume applies once the next song is heard.
+      if (!muted) player?.setVolume(next).catch(() => {})
     },
 
     pause() {
       pending = null
       if (debounceTimer) clearTimeout(debounceTimer)
       player?.pause().catch(() => {})
+      unmute()
     },
 
     disconnect() {
@@ -372,6 +452,9 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
       deviceId = null
       loadedUri = null
       pending = null
+      muted = false
+      if (muteTimer) clearTimeout(muteTimer)
+      muteTimer = null
       sending = false
       // Settle anything waiting for the old player; otherwise a waiting flush never finishes.
       const waiters = readyWaiters
