@@ -15,3 +15,19 @@ export function useShufflePreference() {
   }, [])
   return [shuffle, setShuffle] as const
 }
+
+const VOLUME_KEY = 'swipeify.volume'
+
+/** Last player volume (0–1), or undefined to use the player's default. */
+export function getVolumePreference(): number | undefined {
+  const saved = Number.parseFloat(window.localStorage.getItem(VOLUME_KEY) ?? '')
+  return Number.isFinite(saved) ? Math.min(1, Math.max(0, saved)) : undefined
+}
+
+export function saveVolumePreference(volume: number): void {
+  try {
+    window.localStorage.setItem(VOLUME_KEY, String(volume))
+  } catch {
+    // Not worth bothering the user about.
+  }
+}

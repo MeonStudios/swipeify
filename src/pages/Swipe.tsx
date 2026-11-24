@@ -23,6 +23,9 @@ import {
 import { getShufflePreference } from '../state/preferences'
 import { useSwipeSession } from '../state/SwipeSessionContext'
 
+/** Shift+arrow jumps this far through the song. */
+const SEEK_STEP_MS = 10_000
+
 export default function Swipe() {
   const { playlistId } = useParams<{ playlistId: string }>()
   const navigate = useNavigate()
@@ -76,7 +79,8 @@ export default function Swipe() {
   const peek = ready ? nextTrack(state) : null
   const complete = ready && isComplete(state)
   const justFinished = complete && swipedThisVisit
-  const { availability, isPlaying, positionMs, durationMs, unlock, toggle, replay } = useTrackPlayback(track)
+  const { availability, isPlaying, positionMs, durationMs, volume, unlock, toggle, replay, seekTo, seekBy, setVolume } =
+    useTrackPlayback(track)
 
   const decide = useCallback(
     (decision: Decision) => {
@@ -97,7 +101,7 @@ export default function Swipe() {
     dispatch({ type: 'undo' })
   }, [undoable, unlock, dispatch])
 
-  // Keyboard: ← skip, → keep, space play/pause, Z or Backspace undo.
+  // Keyboard: ← skip, → keep, Shift+←/→ jump 10 s, space play/pause, Z or Backspace undo.
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
@@ -105,6 +109,11 @@ export default function Swipe() {
       const key = event.key.toLowerCase()
       if (!['arrowleft', 'arrowright', ' ', 'z', 'backspace'].includes(key)) return
       event.preventDefault()
+      if (event.shiftKey && (key === 'arrowleft' || key === 'arrowright')) {
+        // Holding Shift+arrow keeps scrubbing, like in most players.
+        seekBy(key === 'arrowleft' ? -SEEK_STEP_MS : SEEK_STEP_MS)
+        return
+      }
       // Holding a key must not decide (or undo) track after track.
       if (event.repeat) return
       if (key === 'arrowleft') decide('skip')
@@ -114,7 +123,7 @@ export default function Swipe() {
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [decide, toggle, undo])
+  }, [decide, toggle, undo, seekBy])
 
   const stats = sessionStats(state)
 
@@ -201,14 +210,17 @@ export default function Swipe() {
                 isPlaying={isPlaying}
                 positionMs={positionMs}
                 durationMs={durationMs}
+                volume={volume}
                 externalUrl={track?.externalUrl ?? null}
                 onToggle={toggle}
                 onReplay={replay}
+                onSeek={seekTo}
+                onVolume={setVolume}
               />
             )}
             <SwipeButtons onDecide={decide} onUndo={undo} disabled={complete} undoDisabled={!undoable} />
             <p className="hidden text-center text-[11px] tracking-wide text-muted/70 sm:block">
-              ← skip · space play/pause · Z undo · keep →
+              ← skip · keep → · space play/pause · ⇧←/→ ±10s · Z undo
             </p>
           </div>
         </>

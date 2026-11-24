@@ -1,4 +1,5 @@
-import { ExternalLink, Pause, Play, RotateCcw } from 'lucide-react'
+import { ExternalLink, Pause, Play, RotateCcw, Volume1, Volume2, VolumeX } from 'lucide-react'
+import { useRef, useState, type CSSProperties, type PointerEvent } from 'react'
 import type { PlaybackAvailability } from '../services/spotify/playback'
 
 interface MusicPlayerProps {
@@ -6,10 +7,14 @@ interface MusicPlayerProps {
   isPlaying: boolean
   positionMs: number
   durationMs: number
+  /** 0–1. */
+  volume: number
   /** Opens the current track in Spotify; offered when the browser can't play it. */
   externalUrl: string | null
   onToggle: () => void
   onReplay: () => void
+  onSeek: (positionMs: number) => void
+  onVolume: (volume: number) => void
 }
 
 const formatTime = (ms: number) => {
@@ -23,15 +28,37 @@ const UNAVAILABLE_REASON: Partial<Record<PlaybackAvailability, string>> = {
   error: 'The Spotify player couldn’t start',
 }
 
+/** Used when unmuting after the volume was dragged all the way down. */
+const UNMUTE_VOLUME = 0.5
+
+/** A slider fills with champagne up to this percentage. */
+const fill = (pct: number) => ({ '--fill': `${pct}%` }) as CSSProperties
+
+/**
+ * After a mouse or touch interaction, give focus back to the page so the
+ * arrow keys swipe again instead of moving the slider. Keyboard users who
+ * tabbed to a slider keep its focus.
+ */
+const releaseFocus = (event: PointerEvent<HTMLInputElement>) => event.currentTarget.blur()
+
 export function MusicPlayer({
   availability,
   isPlaying,
   positionMs,
   durationMs,
+  volume,
   externalUrl,
   onToggle,
   onReplay,
+  onSeek,
+  onVolume,
 }: MusicPlayerProps) {
+  /** Position under the user's finger while dragging; only sent to Spotify on release. */
+  const [dragMs, setDragMs] = useState<number | null>(null)
+  const dragRef = useRef<number | null>(null)
+  /** Volume to return to when unmuting. */
+  const audibleVolume = useRef(volume > 0 ? volume : UNMUTE_VOLUME)
+
   const unavailable = UNAVAILABLE_REASON[availability]
   if (unavailable) {
     return (
@@ -53,15 +80,39 @@ export function MusicPlayer({
   }
 
   const connecting = availability === 'connecting' || availability === 'idle'
-  const pct = durationMs > 0 ? Math.min(100, (positionMs / durationMs) * 100) : 0
+  const shownMs = Math.min(dragMs ?? positionMs, durationMs)
+  const pct = durationMs > 0 ? Math.min(100, (shownMs / durationMs) * 100) : 0
   const status = connecting
     ? 'Connecting to Spotify…'
     : isPlaying || positionMs > 0
       ? 'Playing in Swipeify'
       : 'Tap play to listen'
 
+  function drag(ms: number) {
+    dragRef.current = ms
+    setDragMs(ms)
+  }
+
+  function commitSeek() {
+    if (dragRef.current === null) return
+    onSeek(dragRef.current)
+    dragRef.current = null
+    setDragMs(null)
+  }
+
+  function toggleMute() {
+    if (volume > 0) {
+      audibleVolume.current = volume
+      onVolume(0)
+    } else {
+      onVolume(audibleVolume.current > 0 ? audibleVolume.current : UNMUTE_VOLUME)
+    }
+  }
+
+  const VolumeIcon = volume === 0 ? VolumeX : volume < 0.5 ? Volume1 : Volume2
+
   return (
-    <div className="flex items-center gap-4">
+    <div className="flex items-center gap-3">
       <button
         type="button"
         onClick={onToggle}
@@ -72,16 +123,29 @@ export function MusicPlayer({
         {isPlaying ? <Pause size={18} fill="currentColor" /> : <Play size={18} fill="currentColor" className="translate-x-px" />}
       </button>
 
-      <div className="flex-1">
-        <div className="h-[3px] overflow-hidden rounded-full bg-line">
-          <div
-            className="h-full rounded-full bg-champagne transition-[width] duration-300 ease-linear"
-            style={{ width: `${pct}%` }}
-          />
-        </div>
-        <div className="mt-1.5 flex justify-between text-[11px] tabular-nums text-muted">
-          <span>{formatTime(positionMs)}</span>
-          <span className={connecting ? 'animate-pulse' : ''}>{status}</span>
+      <div className="min-w-0 flex-1 pl-1">
+        <input
+          type="range"
+          aria-label="Position in song"
+          aria-valuetext={`${formatTime(shownMs)} of ${formatTime(durationMs)}`}
+          min={0}
+          max={Math.max(1, durationMs)}
+          step={1000}
+          value={shownMs}
+          disabled={connecting || durationMs === 0}
+          onChange={(e) => drag(Number(e.target.value))}
+          onPointerUp={(e) => {
+            commitSeek()
+            releaseFocus(e)
+          }}
+          onKeyUp={commitSeek}
+          onBlur={commitSeek}
+          className="range-slider block"
+          style={fill(pct)}
+        />
+        <div className="mt-0.5 flex justify-between gap-2 text-[11px] tabular-nums text-muted">
+          <span>{formatTime(shownMs)}</span>
+          <span className={`truncate ${connecting ? 'animate-pulse' : ''}`}>{status}</span>
           <span>{formatTime(durationMs)}</span>
         </div>
       </div>
@@ -96,6 +160,31 @@ export function MusicPlayer({
       >
         <RotateCcw size={17} />
       </button>
+
+      <div className="flex shrink-0 items-center gap-1">
+        <button
+          type="button"
+          onClick={toggleMute}
+          aria-label={volume > 0 ? 'Mute' : 'Unmute'}
+          title={volume > 0 ? 'Mute' : 'Unmute'}
+          className="grid size-9 place-items-center rounded-full text-muted transition-colors hover:text-cream"
+        >
+          <VolumeIcon size={17} />
+        </button>
+        <input
+          type="range"
+          aria-label="Volume"
+          aria-valuetext={`${Math.round(volume * 100)}%`}
+          min={0}
+          max={100}
+          step={1}
+          value={Math.round(volume * 100)}
+          onChange={(e) => onVolume(Number(e.target.value) / 100)}
+          onPointerUp={releaseFocus}
+          className="range-slider hidden w-16 sm:block"
+          style={fill(volume * 100)}
+        />
+      </div>
     </div>
   )
 }

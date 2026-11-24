@@ -11,7 +11,9 @@ class FakePlayer {
   static autoReady = true
   listeners = new Map<string, Listener>()
   calls: string[] = []
-  constructor() {
+  init: { volume?: number }
+  constructor(init: { volume?: number }) {
+    this.init = init
     FakePlayer.last = this
     FakePlayer.created++
   }
@@ -35,6 +37,7 @@ class FakePlayer {
   resume = vi.fn(async () => void this.calls.push('resume'))
   togglePlay = vi.fn(async () => void this.calls.push('togglePlay'))
   seek = vi.fn(async (ms: number) => void this.calls.push(`seek:${ms}`))
+  setVolume = vi.fn(async (volume: number) => void this.calls.push(`volume:${volume}`))
 }
 
 const state = (uri: string, position: number, paused = false) => ({
@@ -313,5 +316,56 @@ describe('playback controller across disconnects', () => {
 
     expect(FakePlayer.created).toBe(created)
     expect(controller.getSnapshot().availability).toBe('idle')
+  })
+})
+
+describe('playback controller seek and volume', () => {
+  beforeEach(() => vi.useFakeTimers())
+  afterEach(() => vi.useRealTimers())
+
+  it('seeks within the loaded track and shows the new position right away', async () => {
+    const { controller, player } = await setup()
+    controller.play('spotify:track:a', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    player.emit('player_state_changed', state('spotify:track:a', 60_000))
+
+    controller.seek('spotify:track:a', 120_000.4)
+    expect(player.calls).toEqual(['seek:120000'])
+    expect(controller.getSnapshot().positionMs).toBe(120_000)
+  })
+
+  it('starts a track that is not loaded yet at the sought position', async () => {
+    const { controller, player, request } = await setup()
+    controller.seek('spotify:track:b', 90_000)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    expect(player.seek).not.toHaveBeenCalled()
+    expect((request.mock.calls[0][1] as { body: unknown }).body).toEqual({ uris: ['spotify:track:b'], position_ms: 90_000 })
+  })
+
+  it('clamps the volume, applies it to the player and keeps it for the next player', async () => {
+    const { controller, player } = await setup()
+    controller.setVolume(1.7)
+    expect(player.calls).toEqual(['volume:1'])
+    controller.setVolume(0.25)
+    expect(controller.getSnapshot().volume).toBe(0.25)
+
+    controller.disconnect()
+    expect(controller.getSnapshot().volume).toBe(0.25)
+    controller.init()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(FakePlayer.last.init.volume).toBe(0.25)
+  })
+
+  it('starts new players at the configured volume', async () => {
+    const controller = createPlaybackController({
+      client: { request: vi.fn(async () => undefined) as never },
+      getAccessToken: async () => 'token',
+      loadPlayerClass: async () => FakePlayer as unknown as typeof Spotify.Player,
+      isSupportedBrowser: () => true,
+      initialVolume: 0.4,
+    })
+    controller.init()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(FakePlayer.last.init.volume).toBe(0.4)
   })
 })

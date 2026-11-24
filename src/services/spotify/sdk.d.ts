@@ -38,6 +38,8 @@ declare namespace Spotify {
     resume(): Promise<void>
     togglePlay(): Promise<void>
     seek(positionMs: number): Promise<void>
+    /** 0–1. */
+    setVolume(volume: number): Promise<void>
     addListener(event: 'ready' | 'not_ready', callback: (instance: WebPlaybackInstance) => void): boolean
     addListener(event: 'player_state_changed', callback: (state: PlaybackState | null) => void): boolean
     addListener(event: ErrorEvent, callback: (error: WebPlaybackError) => void): boolean

@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useRef, useState, useSyncExternalStore } from 'react'
 import { playback } from '../services'
+import { saveVolumePreference } from '../state/preferences'
 import type { Track } from '../types/music'
 
 /** Start each song about a third in: past the intro, usually near the hook. */
@@ -67,13 +68,44 @@ export function useTrackPlayback(track: Track | null) {
     playback.restart(track.uri, startPosition(track))
   }, [track, unlock])
 
+  const canPlay = snapshot.availability === 'ready' || snapshot.availability === 'connecting'
+
+  /** Jumps to `ms` in the current song, starting it there if needed. */
+  const seekTo = useCallback(
+    (ms: number) => {
+      if (!track || !canPlay) return
+      unlock()
+      playback.seek(track.uri, Math.min(Math.max(0, ms), durationMs))
+    },
+    [track, canPlay, durationMs, unlock],
+  )
+
+  /** Jumps `deltaMs` forward (or back, when negative) from the current position. */
+  const seekBy = useCallback(
+    (deltaMs: number) => {
+      if (!track) return
+      // A song that hasn't started yet counts from its usual start point.
+      seekTo((isCurrent ? positionMs : startPosition(track)) + deltaMs)
+    },
+    [track, isCurrent, positionMs, seekTo],
+  )
+
+  const setVolume = useCallback((volume: number) => {
+    playback.setVolume(volume)
+    saveVolumePreference(playback.getSnapshot().volume)
+  }, [])
+
   return {
     availability: snapshot.availability,
     isPlaying,
     positionMs,
     durationMs,
+    volume: snapshot.volume,
     unlock,
     toggle,
     replay,
+    seekTo,
+    seekBy,
+    setVolume,
   }
 }

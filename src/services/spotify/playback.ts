@@ -14,6 +14,9 @@ const SDK_URL = 'https://sdk.scdn.co/spotify-player.js'
 const READY_TIMEOUT_MS = 12_000
 /** Wait this long after a play request; a newer one (fast swiping) replaces it. */
 export const PLAY_DEBOUNCE_MS = 150
+const DEFAULT_VOLUME = 0.8
+
+const clampVolume = (volume: number) => (Number.isFinite(volume) ? Math.min(1, Math.max(0, volume)) : DEFAULT_VOLUME)
 
 export type PlaybackAvailability =
   | 'idle'
@@ -35,6 +38,8 @@ export interface PlaybackSnapshot {
   positionMs: number
   durationMs: number
   updatedAt: number
+  /** 0–1; kept across reconnects. */
+  volume: number
 }
 
 export interface PlaybackController {
@@ -50,6 +55,10 @@ export interface PlaybackController {
   toggle(uri: string, startMs: number): void
   /** Jumps back to `positionMs` and plays, loading `uri` first if needed. */
   restart(uri: string, positionMs: number): void
+  /** Jumps to `positionMs` in `uri`, starting it there if it isn't the loaded track. */
+  seek(uri: string, positionMs: number): void
+  /** 0–1. Applies to the current player and any later one. */
+  setVolume(volume: number): void
   pause(): void
   disconnect(): void
 }
@@ -60,6 +69,8 @@ export interface PlaybackConfig {
   /** Resolves with the SDK's Player class. Injected in tests. */
   loadPlayerClass?: () => Promise<typeof Spotify.Player>
   isSupportedBrowser?: () => boolean
+  /** 0–1; defaults to 0.8. */
+  initialVolume?: number
 }
 
 const INITIAL: PlaybackSnapshot = {
@@ -69,6 +80,7 @@ const INITIAL: PlaybackSnapshot = {
   positionMs: 0,
   durationMs: 0,
   updatedAt: 0,
+  volume: DEFAULT_VOLUME,
 }
 
 let sdkLoading: Promise<typeof Spotify.Player> | null = null
@@ -102,7 +114,8 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
   const loadPlayerClass = config.loadPlayerClass ?? loadSdkPlayerClass
   const isSupportedBrowser = config.isSupportedBrowser ?? isDesktopBrowser
 
-  let snapshot = INITIAL
+  const initial: PlaybackSnapshot = { ...INITIAL, volume: clampVolume(config.initialVolume ?? DEFAULT_VOLUME) }
+  let snapshot = initial
   const listeners = new Set<() => void>()
   let player: Spotify.Player | null = null
   let deviceId: string | null = null
@@ -244,7 +257,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
 
     const instance = new PlayerClass({
       name: 'Swipeify',
-      volume: 0.8,
+      volume: snapshot.volume,
       getOAuthToken: (callback) => {
         config.getAccessToken().then(callback, () => {
           if (player === instance) fail('error')
@@ -327,6 +340,21 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
       if (!snapshot.isPlaying) player?.resume().catch(() => {})
     },
 
+    seek(uri, positionMs) {
+      const target = Math.max(0, Math.round(positionMs))
+      if (!isLoaded(uri)) return play(uri, target)
+      player?.seek(target).catch(() => {})
+      // Show the new position right away; the SDK confirms it with a state event.
+      update({ positionMs: target, updatedAt: Date.now() })
+    },
+
+    setVolume(volume) {
+      const next = clampVolume(volume)
+      if (next === snapshot.volume) return
+      update({ volume: next })
+      player?.setVolume(next).catch(() => {})
+    },
+
     pause() {
       pending = null
       if (debounceTimer) clearTimeout(debounceTimer)
@@ -334,7 +362,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     },
 
     disconnect() {
-      if (snapshot === INITIAL && !player) return
+      if (!player && snapshot.availability === 'idle' && snapshot.activeUri === null) return
       session++
       attempt++
       if (debounceTimer) clearTimeout(debounceTimer)
@@ -349,7 +377,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
       const waiters = readyWaiters
       readyWaiters = []
       waiters.forEach((w) => w.reject(new Error('Playback disconnected')))
-      snapshot = INITIAL
+      snapshot = { ...initial, volume: snapshot.volume }
       listeners.forEach((listener) => listener())
     },
   }
