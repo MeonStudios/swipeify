@@ -7,6 +7,7 @@ import {
   keptTracks,
   nextTrack,
   sessionStats,
+  skippedTracks,
   swipeReducer,
   type SwipeAction,
   type SwipeState,
@@ -90,11 +91,35 @@ describe('swipeReducer', () => {
   })
 
   it('removes a track from the kept list during review', () => {
-    const state = run(start, keep, keep, { type: 'removeKept', trackId: 't1' })
+    const state = run(start, keep, keep, { type: 'changeDecision', trackId: 't1', decision: 'skip' })
     expect(keptTracks(state).map((t) => t.id)).toEqual(['t2'])
     expect(sessionStats(state)).toMatchObject({ kept: 1, skipped: 1 })
     // Removing during review must not move the swipe position.
     expect(currentTrack(state)?.id).toBe('t3')
+  })
+
+  it('rescues a skipped track during review', () => {
+    const state = run(start, skip, keep, { type: 'changeDecision', trackId: 't1', decision: 'keep' })
+    expect(keptTracks(state).map((t) => t.id)).toEqual(['t1', 't2'])
+    expect(skippedTracks(state)).toEqual([])
+    expect(currentTrack(state)?.id).toBe('t3')
+  })
+
+  it('undo takes back the last decision and makes that track current again', () => {
+    const state = run(start, keep, skip, { type: 'undo' })
+    expect(currentTrack(state)?.id).toBe('t2')
+    expect(sessionStats(state)).toEqual({ kept: 1, skipped: 0, unseen: 2, total: 3 })
+  })
+
+  it('undo after the last track leaves the session unfinished', () => {
+    const state = run(start, keep, keep, keep, { type: 'undo' })
+    expect(isComplete(state)).toBe(false)
+    expect(currentTrack(state)?.id).toBe('t3')
+  })
+
+  it('undo with nothing decided does nothing', () => {
+    const before = run(start)
+    expect(swipeReducer(before, { type: 'undo' })).toBe(before)
   })
 
   it('restarts cleanly when a new session starts', () => {
@@ -116,7 +141,7 @@ describe('swipeReducer', () => {
     const shuffledStart: SwipeAction = { type: 'start', playlist, tracks: many, shuffleSeed: 'seed-1' }
     const a = run(shuffledStart)
     expect(a.tracks.map((t) => t.id)).not.toEqual(many.map((t) => t.id))
-    expect([...a.tracks].map((t) => t.id).sort()).toEqual(many.map((t) => t.id).sort())
+    expect(a.tracks.map((t) => t.id).toSorted()).toEqual(many.map((t) => t.id).toSorted())
     expect(run(shuffledStart).tracks).toEqual(a.tracks)
   })
 

@@ -95,6 +95,43 @@ describe('spotify auth', () => {
     expect(ctx.auth.isLoggedIn()).toBe(false)
   })
 
+  it('stays logged in when the token endpoint is temporarily unavailable', async () => {
+    const ctx = setup(tokenResponse('access-1', 'refresh-1'), json(503, {}), json(429, {}))
+    await login(ctx)
+    await expect(ctx.auth.forceRefresh()).rejects.toThrow(/trouble/)
+    await expect(ctx.auth.forceRefresh()).rejects.not.toBeInstanceOf(SpotifyAuthError)
+    expect(ctx.auth.isLoggedIn()).toBe(true)
+  })
+
+  it('forgets the pending login after a failed callback, so the same state cannot be reused', async () => {
+    const ctx = setup(tokenResponse('access-1', 'refresh-1'))
+    const url = new URL(await ctx.auth.beginLogin())
+    const state = url.searchParams.get('state')!
+    await expect(ctx.auth.completeLogin(new URLSearchParams({ code: 'c1', state: 'forged' }))).rejects.toThrow()
+    await expect(ctx.auth.completeLogin(new URLSearchParams({ code: 'c2', state }))).rejects.toThrow(/no longer valid/)
+    expect(ctx.http.mock).not.toHaveBeenCalled()
+  })
+
+  it('rejects a login that was started too long ago', async () => {
+    const ctx = setup(tokenResponse('access-1', 'refresh-1'))
+    const url = new URL(await ctx.auth.beginLogin())
+    ctx.advance(11 * 60_000)
+    const params = new URLSearchParams({ code: 'c', state: url.searchParams.get('state')! })
+    await expect(ctx.auth.completeLogin(params)).rejects.toThrow(/no longer valid/)
+  })
+
+  it('does not show text from the callback URL in its error message', async () => {
+    const { auth } = setup()
+    const error = await auth.completeLogin(new URLSearchParams({ error: 'Call 555-0100 for help' })).catch((e: Error) => e)
+    expect((error as Error).message).not.toContain('555')
+  })
+
+  it('treats malformed stored tokens as logged out', () => {
+    const ctx = setup()
+    ctx.storage.setItem(TOKENS_KEY, JSON.stringify({ accessToken: 1 }))
+    expect(ctx.auth.isLoggedIn()).toBe(false)
+  })
+
   it('logout forgets the tokens', async () => {
     const ctx = setup(tokenResponse('access-1', 'refresh-1'))
     await login(ctx)

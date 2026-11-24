@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import type { Playlist, Track } from '../types/music'
-import { clearSession, loadSession, saveSession } from './sessionStore'
+import { clearSession, createSessionWriter, loadSession, saveSession } from './sessionStore'
 import { initialSwipeState, swipeReducer, type SwipeAction, type SwipeState } from './swipeSession'
 
 const track = (id: string): Track => ({
@@ -50,6 +50,63 @@ describe('session store', () => {
     expect(loadSession(storage)).toEqual(state)
   })
 
+  it('writes the tracks once and only the small decisions record on each swipe', () => {
+    const storage = memoryStorage()
+    const writes: string[] = []
+    const spy = { ...storage, setItem: (k: string, v: string) => (writes.push(k), storage.setItem(k, v)) }
+    const write = createSessionWriter(spy)
+    let state = run({ type: 'start', playlist, tracks })
+    write(state)
+    for (let i = 0; i < 3; i++) {
+      state = swipeReducer(state, { type: 'decide', decision: i === 1 ? 'skip' : 'keep' })
+      write(state)
+    }
+    expect(writes.filter((k) => k === 'swipeify.session')).toHaveLength(1)
+    expect(writes.filter((k) => k === 'swipeify.session.decisions')).toHaveLength(4)
+    expect(JSON.parse(storage.data.get('swipeify.session.decisions')!).decisions).toBe('ksk')
+    expect(loadSession(storage)).toEqual(state)
+  })
+
+  it('stores only the largest and smallest album image', () => {
+    const storage = memoryStorage()
+    const images = [640, 300, 64].map((size) => ({ url: `https://i.scdn.co/${size}`, width: size, height: size }))
+    const withArt = { ...track('a'), album: { id: 'al', name: 'Album', images } }
+    saveSession(run({ type: 'start', playlist, tracks: [withArt] }), storage)
+    expect(loadSession(storage)!.tracks[0].album.images.map((i) => i.width)).toEqual([640, 64])
+  })
+
+  it('ignores decisions that belong to a different session', () => {
+    const storage = memoryStorage()
+    saveSession(run({ type: 'start', playlist, tracks }, { type: 'decide', decision: 'keep' }), storage)
+    storage.setItem('swipeify.session.decisions', JSON.stringify({ id: -1, decisions: 'kkk' }))
+    expect(loadSession(storage)!.decisions).toEqual([])
+  })
+
+  it('reports a failed save instead of throwing', () => {
+    const storage = {
+      ...memoryStorage(),
+      setItem: () => {
+        throw new DOMException('full', 'QuotaExceededError')
+      },
+    }
+    expect(saveSession(run({ type: 'start', playlist, tracks }), storage)).toBe(false)
+  })
+
+  it('still loads a session saved by the previous version', () => {
+    const storage = memoryStorage()
+    storage.setItem(
+      'swipeify.session',
+      JSON.stringify({
+        version: 1,
+        playlist,
+        sourceTracks: tracks,
+        order: tracks.map((t) => t.id),
+        decisions: [{ trackId: 'a', decision: 'keep' }],
+      }),
+    )
+    expect(loadSession(storage)?.decisions).toEqual([{ trackId: 'a', decision: 'keep' }])
+  })
+
   it('does not save an empty session', () => {
     const storage = memoryStorage()
     saveSession(initialSwipeState, storage)
@@ -64,6 +121,19 @@ describe('session store', () => {
     storage.setItem(
       'swipeify.session',
       JSON.stringify({ version: 1, playlist, sourceTracks: [track('a')], order: ['a', 'missing'], decisions: [] }),
+    )
+    expect(loadSession(storage)).toBeNull()
+    storage.setItem('swipeify.session', JSON.stringify({ version: 1, playlist, sourceTracks: [track('a')] }))
+    expect(loadSession(storage)).toBeNull()
+    storage.setItem(
+      'swipeify.session',
+      JSON.stringify({
+        version: 1,
+        playlist,
+        sourceTracks: [track('a')],
+        order: ['a'],
+        decisions: [{ trackId: 'a', decision: 'keep' }, { trackId: 'b', decision: 'keep' }],
+      }),
     )
     expect(loadSession(storage)).toBeNull()
   })

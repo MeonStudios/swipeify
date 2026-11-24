@@ -6,10 +6,14 @@ type Listener = (arg: unknown) => void
 /** Stand-in for the SDK's Player: records calls and lets tests emit events. */
 class FakePlayer {
   static last: FakePlayer
+  static created = 0
+  /** When false, the player stays "connecting" until a test emits `ready`. */
+  static autoReady = true
   listeners = new Map<string, Listener>()
   calls: string[] = []
   constructor() {
     FakePlayer.last = this
+    FakePlayer.created++
   }
   addListener(event: string, callback: Listener) {
     this.listeners.set(event, callback)
@@ -19,7 +23,7 @@ class FakePlayer {
     this.listeners.get(event)?.(arg)
   }
   async connect() {
-    queueMicrotask(() => this.emit('ready', { device_id: 'dev-1' }))
+    if (FakePlayer.autoReady) queueMicrotask(() => this.emit('ready', { device_id: 'dev-1' }))
     return true
   }
   disconnect() {}
@@ -198,5 +202,116 @@ describe('playback controller release', () => {
     await vi.advanceTimersByTimeAsync(0)
     expect(FakePlayer.last).not.toBe(player)
     expect(controller.getSnapshot().availability).toBe('ready')
+  })
+})
+
+function createController(loadPlayerClass = async () => FakePlayer as unknown as typeof Spotify.Player) {
+  const request = vi.fn(async (_path: string, _options?: unknown) => undefined)
+  const controller = createPlaybackController({
+    client: { request: request as never },
+    getAccessToken: async () => 'token',
+    loadPlayerClass,
+    isSupportedBrowser: () => true,
+  })
+  return { controller, request }
+}
+
+describe('playback controller across disconnects', () => {
+  beforeEach(() => {
+    vi.useFakeTimers()
+    FakePlayer.autoReady = true
+  })
+  afterEach(() => {
+    vi.useRealTimers()
+    FakePlayer.autoReady = true
+  })
+
+  it('a play request waiting for the player does not block playback after a disconnect', async () => {
+    FakePlayer.autoReady = false
+    const { controller, request } = createController()
+    controller.init()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(controller.getSnapshot().availability).toBe('connecting')
+
+    // Swipe while still connecting, then leave the screen before the player is ready.
+    controller.play('spotify:track:a', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    controller.disconnect()
+    await vi.advanceTimersByTimeAsync(0)
+
+    FakePlayer.autoReady = true
+    controller.init()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(controller.getSnapshot().availability).toBe('ready')
+    controller.play('spotify:track:b', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    expect(request).toHaveBeenCalledTimes(1)
+    expect((request.mock.calls[0][1] as { body: { uris: string[] } }).body.uris).toEqual(['spotify:track:b'])
+  })
+
+  it('init → disconnect → init while the SDK loads builds a single player', async () => {
+    let releaseSdk!: () => void
+    const sdkLoaded = new Promise<void>((resolve) => (releaseSdk = resolve))
+    const { controller } = createController(async () => {
+      await sdkLoaded
+      return FakePlayer as unknown as typeof Spotify.Player
+    })
+    const before = FakePlayer.created
+
+    controller.init()
+    controller.disconnect()
+    controller.init()
+    releaseSdk()
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(FakePlayer.created - before).toBe(1)
+    expect(controller.getSnapshot().availability).toBe('ready')
+  })
+
+  it("an earlier attempt's ready timeout does not fail a newer connection", async () => {
+    FakePlayer.autoReady = false
+    const { controller } = createController()
+    controller.init()
+    await vi.advanceTimersByTimeAsync(5_000)
+    controller.disconnect()
+    controller.init()
+
+    // Past the first attempt's 12 s timeout; the second attempt still has time left.
+    await vi.advanceTimersByTimeAsync(8_000)
+    expect(controller.getSnapshot().availability).toBe('connecting')
+    FakePlayer.last.emit('ready', { device_id: 'dev-2' })
+    expect(controller.getSnapshot().availability).toBe('ready')
+  })
+
+  it('errors from a discarded player do not fail the current one', async () => {
+    const { controller } = createController()
+    controller.init()
+    await vi.advanceTimersByTimeAsync(0)
+    const old = FakePlayer.last
+    controller.disconnect()
+    controller.init()
+    await vi.advanceTimersByTimeAsync(0)
+
+    old.emit('account_error', { message: 'late' })
+    expect(controller.getSnapshot().availability).toBe('ready')
+  })
+
+  it('a 404 that arrives after disconnect does not reconnect the player', async () => {
+    const { controller, request } = createController()
+    controller.init()
+    await vi.advanceTimersByTimeAsync(0)
+    const { SpotifyApiError } = await import('./client')
+    let rejectPlay!: (e: Error) => void
+    request.mockImplementationOnce(() => new Promise<undefined>((_, reject) => (rejectPlay = reject)))
+
+    controller.play('spotify:track:a', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    const created = FakePlayer.created
+    controller.disconnect()
+    rejectPlay(new SpotifyApiError(404, 'Device not found'))
+    await vi.advanceTimersByTimeAsync(0)
+
+    expect(FakePlayer.created).toBe(created)
+    expect(controller.getSnapshot().availability).toBe('idle')
   })
 })

@@ -79,10 +79,14 @@ function loadSdkPlayerClass(): Promise<typeof Spotify.Player> {
     const script = document.createElement('script')
     script.src = SDK_URL
     script.async = true
-    script.onerror = () => {
-      sdkLoading = null
-      reject(new Error('Could not load the Spotify player'))
-    }
+    script.addEventListener(
+      'error',
+      () => {
+        sdkLoading = null
+        reject(new Error('Could not load the Spotify player'))
+      },
+      { once: true },
+    )
     document.body.appendChild(script)
   })
   return sdkLoading
@@ -110,6 +114,14 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
   let pending: { uri: string; positionMs: number } | null = null
   let debounceTimer: ReturnType<typeof setTimeout> | null = null
   let sending = false
+  /**
+   * Bumped by `disconnect()`. Async work started before a disconnect (a play
+   * request in flight, a 404 retry) checks it and stops instead of touching
+   * the next session.
+   */
+  let session = 0
+  /** Bumped on every connect attempt and on disconnect; stale attempts, timers and listeners bail out. */
+  let attempt = 0
 
   function update(patch: Partial<PlaybackSnapshot>) {
     snapshot = { ...snapshot, ...patch }
@@ -144,18 +156,23 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
   async function flush() {
     if (sending || !pending) return
     sending = true
+    const mySession = session
     try {
       while (pending) {
         const request = pending
         pending = null
         try {
           await whenReady()
+          if (mySession !== session) return
           // Starting playback on our device also transfers it away from other devices.
           await config.client.request(`/me/player/play?device_id=${encodeURIComponent(deviceId!)}`, {
             method: 'PUT',
             body: { uris: [request.uri], position_ms: Math.max(0, Math.round(request.positionMs)) },
           })
+          if (mySession !== session) return
         } catch (error) {
+          // Disconnected meanwhile (left the screen, logged out): don't fail or reconnect anything.
+          if (mySession !== session) return
           if (error instanceof SpotifyApiError && error.status === 403) fail('premium-required')
           else if (error instanceof SpotifyApiError && error.status === 404) {
             // Spotify no longer knows our device: reconnect and retry unless a newer song was requested.
@@ -167,7 +184,8 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
         }
       }
     } finally {
-      sending = false
+      // After a disconnect, `sending` already belongs to the next session.
+      if (mySession === session) sending = false
     }
   }
 
@@ -206,9 +224,11 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
   }
 
   async function connect() {
+    const myAttempt = ++attempt
+    const isCurrent = () => myAttempt === attempt
     if (!isSupportedBrowser()) return fail('unsupported')
     const timeout = setTimeout(() => {
-      if (snapshot.availability === 'connecting') fail('unsupported')
+      if (isCurrent() && snapshot.availability === 'connecting') fail('unsupported')
     }, READY_TIMEOUT_MS)
 
     let PlayerClass: typeof Spotify.Player
@@ -216,18 +236,27 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
       PlayerClass = await loadPlayerClass()
     } catch {
       clearTimeout(timeout)
-      return fail('error')
+      if (isCurrent()) fail('error')
+      return
     }
-    if (snapshot.availability !== 'connecting') return
+    // A newer attempt or a disconnect happened while the SDK loaded (e.g. StrictMode's init → disconnect → init).
+    if (!isCurrent() || snapshot.availability !== 'connecting') return clearTimeout(timeout)
 
     const instance = new PlayerClass({
       name: 'Swipeify',
       volume: 0.8,
       getOAuthToken: (callback) => {
-        config.getAccessToken().then(callback, () => fail('error'))
+        config.getAccessToken().then(callback, () => {
+          if (player === instance) fail('error')
+        })
       },
     })
     player = instance
+    /** Fails the current attempt, unless this instance has been replaced. */
+    const failIfCurrent = (availability: PlaybackAvailability) => {
+      clearTimeout(timeout)
+      if (player === instance) fail(availability)
+    }
 
     instance.addListener('ready', ({ device_id }) => {
       if (player !== instance) return
@@ -249,26 +278,14 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
         if (player === instance && snapshot.availability === 'connecting') reconnect()
       }, READY_TIMEOUT_MS)
     })
-    instance.addListener('initialization_error', () => {
-      clearTimeout(timeout)
-      fail('unsupported')
-    })
-    instance.addListener('account_error', () => {
-      clearTimeout(timeout)
-      fail('premium-required')
-    })
-    instance.addListener('authentication_error', () => {
-      clearTimeout(timeout)
-      fail('error')
-    })
+    instance.addListener('initialization_error', () => failIfCurrent('unsupported'))
+    instance.addListener('account_error', () => failIfCurrent('premium-required'))
+    instance.addListener('authentication_error', () => failIfCurrent('error'))
     instance.addListener('playback_error', (error) => console.warn('[playback]', error.message))
     instance.addListener('player_state_changed', onStateChanged)
 
     const connected = await instance.connect()
-    if (!connected) {
-      clearTimeout(timeout)
-      fail('unsupported')
-    }
+    if (!connected) failIfCurrent('unsupported')
   }
 
   return {
@@ -318,13 +335,20 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
 
     disconnect() {
       if (snapshot === INITIAL && !player) return
+      session++
+      attempt++
       if (debounceTimer) clearTimeout(debounceTimer)
+      debounceTimer = null
       player?.disconnect()
       player = null
       deviceId = null
       loadedUri = null
       pending = null
+      sending = false
+      // Settle anything waiting for the old player; otherwise a waiting flush never finishes.
+      const waiters = readyWaiters
       readyWaiters = []
+      waiters.forEach((w) => w.reject(new Error('Playback disconnected')))
       snapshot = INITIAL
       listeners.forEach((listener) => listener())
     },

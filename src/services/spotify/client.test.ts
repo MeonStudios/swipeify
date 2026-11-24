@@ -78,4 +78,10 @@ describe('spotify client', () => {
     ])
     expect(http.call(1).url).toBe('https://api.spotify.com/v1/me/tracks?offset=2')
   })
+
+  it('never sends the token to a `next` link outside the Spotify API', async () => {
+    const { client, http } = setup(json(200, { items: [1], total: 2, next: 'https://evil.example/steal' }))
+    await expect(client.getAll('/me/tracks')).rejects.toThrow(/Refusing/)
+    expect(http.mock).toHaveBeenCalledTimes(1)
+  })
 })

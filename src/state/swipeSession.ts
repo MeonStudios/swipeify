@@ -22,7 +22,10 @@ export type SwipeAction =
   /** `shuffleSeed` swipes the tracks in a random (seeded, so reproducible) order. */
   | { type: 'start'; playlist: Playlist; tracks: Track[]; shuffleSeed?: string }
   | { type: 'decide'; decision: Decision }
-  | { type: 'removeKept'; trackId: string }
+  /** Takes back the last decision; that track becomes the current one again. */
+  | { type: 'undo' }
+  /** Flips the decision for an already reviewed track (drop a keeper, rescue a skipped one). */
+  | { type: 'changeDecision'; trackId: string; decision: Decision }
   | { type: 'restart' }
   | { type: 'reset' }
 
@@ -52,11 +55,15 @@ export function swipeReducer(state: SwipeState, action: SwipeAction): SwipeState
       }
     }
 
-    case 'removeKept':
+    case 'undo':
+      if (state.decisions.length === 0) return state
+      return { ...state, decisions: state.decisions.slice(0, -1) }
+
+    case 'changeDecision':
       return {
         ...state,
         decisions: state.decisions.map((entry) =>
-          entry.trackId === action.trackId ? { ...entry, decision: 'skip' } : entry,
+          entry.trackId === action.trackId ? { ...entry, decision: action.decision } : entry,
         ),
       }
 
@@ -81,13 +88,18 @@ export const nextTrack = (state: SwipeState): Track | null =>
 export const isComplete = (state: SwipeState) =>
   state.tracks.length > 0 && currentIndex(state) >= state.tracks.length
 
-/** Kept tracks, in the source playlist's order (even when swiped shuffled). */
-export function keptTracks(state: SwipeState): Track[] {
-  const kept = new Set(
-    state.decisions.filter((entry) => entry.decision === 'keep').map((entry) => entry.trackId),
-  )
-  return state.sourceTracks.filter((track) => kept.has(track.id))
+export const canUndo = (state: SwipeState) => state.decisions.length > 0
+
+function tracksWith(state: SwipeState, decision: Decision): Track[] {
+  const ids = new Set(state.decisions.filter((entry) => entry.decision === decision).map((entry) => entry.trackId))
+  return state.sourceTracks.filter((track) => ids.has(track.id))
 }
+
+/** Kept tracks, in the source playlist's order (even when swiped shuffled). */
+export const keptTracks = (state: SwipeState): Track[] => tracksWith(state, 'keep')
+
+/** Skipped tracks, in the source playlist's order. */
+export const skippedTracks = (state: SwipeState): Track[] => tracksWith(state, 'skip')
 
 export function sessionStats(state: SwipeState) {
   const kept = state.decisions.filter((entry) => entry.decision === 'keep').length

@@ -13,5 +13,28 @@ export interface MusicService {
   getPlaylist(playlistId: string): Promise<Playlist | null>
   /** All playable tracks, without episodes, local files, unavailable tracks or duplicates. */
   getPlaylistTracks(playlistId: string, onProgress?: ProgressCallback): Promise<Track[]>
-  createPlaylist(name: string, trackUris: string[]): Promise<CreatedPlaylist>
+  /**
+   * Creates a private playlist with `trackUris`. Pass the `progress` of a
+   * failed attempt (from `PlaylistSaveError`) to add only the missing tracks
+   * to the playlist that attempt already created, instead of making a duplicate.
+   */
+  createPlaylist(name: string, trackUris: string[], resume?: SaveProgress): Promise<CreatedPlaylist>
+}
+
+/** How far a playlist save got before it failed. */
+export interface SaveProgress {
+  playlist: CreatedPlaylist
+  /** The first `added` URIs are in the playlist. */
+  added: number
+}
+
+/** Saving failed after the playlist was created; `progress` resumes it. */
+export class PlaylistSaveError extends Error {
+  readonly progress: SaveProgress
+
+  constructor(cause: unknown, progress: SaveProgress) {
+    super(cause instanceof Error ? cause.message : 'Could not add all tracks to the playlist.', { cause })
+    this.name = 'PlaylistSaveError'
+    this.progress = progress
+  }
 }

@@ -4,9 +4,14 @@ const UNRESERVED = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234567
 
 /** Cryptographically random string of unreserved URL characters (43–128 chars for a verifier). */
 export function randomString(length = 64): string {
-  const bytes = crypto.getRandomValues(new Uint8Array(length))
+  // Rejection sampling: only bytes below the largest multiple of 66 map evenly onto the alphabet.
+  const limit = 256 - (256 % UNRESERVED.length)
   let out = ''
-  for (const byte of bytes) out += UNRESERVED[byte % UNRESERVED.length]
+  while (out.length < length) {
+    for (const byte of crypto.getRandomValues(new Uint8Array(length))) {
+      if (byte < limit && out.length < length) out += UNRESERVED[byte % UNRESERVED.length]
+    }
+  }
   return out
 }
 

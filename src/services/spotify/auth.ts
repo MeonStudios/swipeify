@@ -11,6 +11,8 @@ const PENDING_KEY = 'swipeify.spotify.pending-login'
 
 /** Refresh this long before the access token actually expires. */
 const EXPIRY_MARGIN_MS = 60_000
+/** A login started longer ago than this is abandoned; its verifier and state are no longer accepted. */
+const PENDING_LOGIN_TTL_MS = 10 * 60_000
 
 export interface TokenSet {
   accessToken: string
@@ -67,7 +69,30 @@ export function createSpotifyAuth(config: AuthConfig): SpotifyAuth {
     const raw = storage.getItem(TOKENS_KEY)
     if (!raw) return null
     try {
-      return JSON.parse(raw) as TokenSet
+      const tokens = JSON.parse(raw) as Partial<TokenSet> | null
+      if (
+        typeof tokens?.accessToken !== 'string' ||
+        typeof tokens.refreshToken !== 'string' ||
+        typeof tokens.expiresAt !== 'number'
+      ) {
+        return null
+      }
+      return tokens as TokenSet
+    } catch {
+      return null
+    }
+  }
+
+  /** Reads and forgets the pending login: a verifier and state are only ever used once. */
+  function takePendingLogin(): { verifier: string; state: string } | null {
+    const raw = storage.getItem(PENDING_KEY)
+    storage.removeItem(PENDING_KEY)
+    if (!raw) return null
+    try {
+      const pending = JSON.parse(raw) as { verifier?: unknown; state?: unknown; createdAt?: unknown } | null
+      if (typeof pending?.verifier !== 'string' || typeof pending.state !== 'string') return null
+      if (typeof pending.createdAt !== 'number' || now() - pending.createdAt > PENDING_LOGIN_TTL_MS) return null
+      return { verifier: pending.verifier, state: pending.state }
     } catch {
       return null
     }
@@ -92,11 +117,16 @@ export function createSpotifyAuth(config: AuthConfig): SpotifyAuth {
     })
     if (!response.ok) {
       const details = (await response.json().catch(() => null)) as { error?: string } | null
-      throw new SpotifyAuthError(
-        response.status === 400 && details?.error === 'invalid_grant'
-          ? undefined
-          : `Spotify login failed (${response.status}${details?.error ? `: ${details.error}` : ''}).`,
-      )
+      // 400/401: the code or refresh token is invalid or revoked; that won't fix itself.
+      if (response.status === 400 || response.status === 401) {
+        throw new SpotifyAuthError(
+          details?.error === 'invalid_grant'
+            ? undefined
+            : `Spotify login failed (${response.status}${details?.error ? `: ${details.error}` : ''}).`,
+        )
+      }
+      // 429/5xx: Spotify is busy or down. The login itself is still valid, so don't log out.
+      throw new Error('Spotify is having trouble right now. Please try again in a moment.')
     }
     return (await response.json()) as TokenResponse
   }
@@ -124,7 +154,7 @@ export function createSpotifyAuth(config: AuthConfig): SpotifyAuth {
     async beginLogin() {
       const verifier = randomString(64)
       const state = randomString(16)
-      storage.setItem(PENDING_KEY, JSON.stringify({ verifier, state }))
+      storage.setItem(PENDING_KEY, JSON.stringify({ verifier, state, createdAt: now() }))
       const params = new URLSearchParams({
         client_id: clientId,
         response_type: 'code',
@@ -144,16 +174,15 @@ export function createSpotifyAuth(config: AuthConfig): SpotifyAuth {
       if (existing) return existing
 
       const promise = (async () => {
+        // Whatever happens below, this login attempt is used up.
+        const pending = takePendingLogin()
         const error = params.get('error')
         if (error) {
+          // Fixed messages only: the query string is attacker-controllable text.
           throw new SpotifyAuthError(
-            error === 'access_denied' ? 'You cancelled the Spotify login.' : `Spotify login failed: ${error}.`,
+            error === 'access_denied' ? 'You cancelled the Spotify login.' : 'Spotify login failed. Please try again.',
           )
         }
-        const pending = JSON.parse(storage.getItem(PENDING_KEY) ?? 'null') as {
-          verifier: string
-          state: string
-        } | null
         if (!code || !pending || pending.state !== params.get('state')) {
           throw new SpotifyAuthError('This login link is no longer valid. Please connect again.')
         }
@@ -164,7 +193,6 @@ export function createSpotifyAuth(config: AuthConfig): SpotifyAuth {
           code_verifier: pending.verifier,
         })
         saveTokens(response)
-        storage.removeItem(PENDING_KEY)
       })()
       completing.set(code, promise)
       return promise

@@ -1,5 +1,5 @@
 import { LIKED_SONGS_ID, type Playlist } from '../../types/music'
-import type { MusicService } from '../musicService'
+import { PlaylistSaveError, type MusicService } from '../musicService'
 import type { SpotifyClient } from './client'
 import { likedSongsPlaylist, mapPlaylist, toPlayableTracks, type RawEntry, type RawPlaylist } from './mapping'
 
@@ -51,23 +51,36 @@ export function createSpotifyMusicService(client: SpotifyClient): MusicService {
       return toPlayableTracks(entries)
     },
 
-    async createPlaylist(name, trackUris) {
-      const created = await client.request<RawPlaylist>('/me/playlists', {
-        method: 'POST',
-        body: { name, public: false, description: 'Made with Swipeify' },
-      })
-      for (let i = 0; i < trackUris.length; i += ADD_BATCH_SIZE) {
-        await client.request(`/playlists/${created.id}/items`, {
+    async createPlaylist(name, trackUris, resume) {
+      let playlist = resume?.playlist
+      if (!playlist) {
+        const created = await client.request<RawPlaylist>('/me/playlists', {
           method: 'POST',
-          body: { uris: trackUris.slice(i, i + ADD_BATCH_SIZE) },
+          body: { name, public: false, description: 'Made with Swipeify' },
         })
+        playlist = {
+          id: created.id,
+          name: created.name,
+          trackCount: 0,
+          url: created.external_urls?.spotify ?? `https://open.spotify.com/playlist/${created.id}`,
+        }
       }
-      return {
-        id: created.id,
-        name: created.name,
-        trackCount: trackUris.length,
-        url: created.external_urls?.spotify ?? `https://open.spotify.com/playlist/${created.id}`,
+
+      // From here on the playlist exists: a failure must say how far it got so a retry can resume.
+      let added = resume?.added ?? 0
+      try {
+        while (added < trackUris.length) {
+          const batch = trackUris.slice(added, added + ADD_BATCH_SIZE)
+          await client.request(`/playlists/${encodeURIComponent(playlist.id)}/items`, {
+            method: 'POST',
+            body: { uris: batch },
+          })
+          added += batch.length
+        }
+      } catch (error) {
+        throw new PlaylistSaveError(error, { playlist: { ...playlist, trackCount: added }, added })
       }
+      return { ...playlist, trackCount: trackUris.length }
     },
   }
 }

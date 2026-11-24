@@ -3,6 +3,7 @@
 import type { SpotifyAuth } from './auth'
 
 const BASE_URL = 'https://api.spotify.com/v1'
+const API_ORIGIN = new URL(BASE_URL).origin
 
 /** Retries for 429 Too Many Requests before giving up. */
 const MAX_RATE_LIMIT_RETRIES = 3
@@ -62,6 +63,8 @@ const defaultSleep = (ms: number) => new Promise<void>((resolve) => setTimeout(r
 export function createSpotifyClient({ auth, fetch: fetchFn, sleep = defaultSleep }: ClientConfig): SpotifyClient {
   async function request<T>(path: string, options: RequestOptions = {}): Promise<T> {
     const url = path.startsWith('https://') ? path : `${BASE_URL}${path}`
+    // Absolute URLs come from `next` links in responses; never send the token anywhere but the API.
+    if (new URL(url).origin !== API_ORIGIN) throw new Error(`Refusing to send a Spotify request to ${new URL(url).origin}`)
     let token = await auth.getAccessToken()
     let refreshedAfter401 = false
     let rateLimitRetries = 0

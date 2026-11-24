@@ -1,5 +1,6 @@
 import type { ReactNode } from 'react'
 import { BrowserRouter, Navigate, Route, Routes } from 'react-router'
+import { useLogoutInOtherTabs } from './hooks/useLogout'
 import Callback from './pages/Callback'
 import Home from './pages/Home'
 import Playlists from './pages/Playlists'
@@ -14,11 +15,17 @@ function RequireAuth({ children }: { children: ReactNode }) {
   return auth.isLoggedIn() ? children : <Navigate to="/" replace />
 }
 
+function LogoutSync() {
+  useLogoutInOtherTabs()
+  return null
+}
+
 export default function App() {
   return (
     <BrowserRouter>
       <SwipeSessionProvider>
         <SessionPersistence />
+        <LogoutSync />
         <Routes>
           <Route path="/" element={<Home />} />
           <Route path="/callback" element={<Callback />} />

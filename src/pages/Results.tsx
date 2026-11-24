@@ -1,16 +1,20 @@
 import { AnimatePresence, motion } from 'motion/react'
-import { Check, ChevronLeft, ExternalLink, Loader2, X } from 'lucide-react'
+import { Check, ChevronDown, ChevronLeft, ExternalLink, Heart, Loader2, X } from 'lucide-react'
 import { useState } from 'react'
 import { Link, Navigate, useNavigate } from 'react-router'
 import { Screen } from '../components/Screen'
 import { Wordmark } from '../components/Wordmark'
 import { musicService } from '../services'
+import { PlaylistSaveError, type SaveProgress } from '../services/musicService'
 import { clearSession } from '../state/sessionStore'
-import { isComplete, keptTracks, sessionStats } from '../state/swipeSession'
+import { isComplete, keptTracks, sessionStats, skippedTracks } from '../state/swipeSession'
 import { useSwipeSession } from '../state/SwipeSessionContext'
-import type { CreatedPlaylist } from '../types/music'
+import type { CreatedPlaylist, Track } from '../types/music'
 
 const ease = [0.22, 1, 0.36, 1] as const
+
+/** Spotify lists images largest first; the smallest is plenty for a 48px thumbnail. */
+const thumbnail = (track: Track) => track.album.images.at(-1)?.url
 
 export default function Results() {
   const navigate = useNavigate()
@@ -19,22 +23,32 @@ export default function Results() {
   const [creating, setCreating] = useState(false)
   const [created, setCreated] = useState<CreatedPlaylist | null>(null)
   const [error, setError] = useState<string | null>(null)
+  /**
+   * Set when a save failed after the playlist was created. Retrying adds the
+   * missing tracks to that playlist, so the selection is locked meanwhile.
+   */
+  const [partial, setPartial] = useState<SaveProgress | null>(null)
+  const [showSkipped, setShowSkipped] = useState(false)
 
   if (!state.playlist) return <Navigate to="/playlists" replace />
 
   const kept = keptTracks(state)
+  const skipped = skippedTracks(state)
   const stats = sessionStats(state)
   const canCreate = kept.length > 0 && name.trim().length > 0 && !creating
+  const locked = partial !== null || creating
 
   async function create() {
     if (!canCreate) return
     setCreating(true)
     setError(null)
     try {
-      setCreated(await musicService.createPlaylist(name.trim(), kept.map((t) => t.uri)))
+      setCreated(await musicService.createPlaylist(name.trim(), kept.map((t) => t.uri), partial ?? undefined))
+      setPartial(null)
       // Done: a reload must not offer to create the same playlist again.
       clearSession()
     } catch (e) {
+      if (e instanceof PlaylistSaveError) setPartial(e.progress)
       setError(e instanceof Error ? e.message : 'Could not create the playlist')
     } finally {
       setCreating(false)
@@ -131,6 +145,7 @@ export default function Results() {
         <input
           value={name}
           onChange={(e) => setName(e.target.value)}
+          disabled={locked}
           maxLength={100}
           className="mt-2 w-full border-b border-line bg-transparent pb-2 font-serif text-2xl tracking-tight text-cream outline-none transition-colors placeholder:text-muted/50 focus:border-champagne"
           placeholder="Name your playlist"
@@ -147,23 +162,17 @@ export default function Results() {
               transition={{ duration: 0.35, ease }}
               className="flex items-center gap-4 border-b border-line py-3"
             >
-              <img
-                src={track.album.images[0]?.url}
-                alt=""
-                className="size-12 shrink-0 rounded-lg border border-line object-cover"
-              />
-              <div className="min-w-0 flex-1">
-                <p className="truncate text-[15px] text-cream">{track.name}</p>
-                <p className="truncate text-xs text-muted">{track.artists.map((a) => a.name).join(', ')}</p>
-              </div>
-              <button
-                type="button"
-                onClick={() => dispatch({ type: 'removeKept', trackId: track.id })}
-                aria-label={`Remove ${track.name}`}
-                className="grid size-8 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-raised hover:text-cream"
-              >
-                <X size={16} />
-              </button>
+              <TrackRow track={track} />
+              {!locked && (
+                <button
+                  type="button"
+                  onClick={() => dispatch({ type: 'changeDecision', trackId: track.id, decision: 'skip' })}
+                  aria-label={`Remove ${track.name}`}
+                  className="grid size-8 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-raised hover:text-cream"
+                >
+                  <X size={16} />
+                </button>
+              )}
             </motion.li>
           ))}
         </AnimatePresence>
@@ -191,8 +200,47 @@ export default function Results() {
         )}
       </ul>
 
+      {skipped.length > 0 && !locked && (
+        <section className="mt-8">
+          <button
+            type="button"
+            onClick={() => setShowSkipped((open) => !open)}
+            aria-expanded={showSkipped}
+            className="flex w-full items-center justify-between text-left text-sm text-muted transition-colors hover:text-cream"
+          >
+            <span>
+              {skipped.length} skipped {skipped.length === 1 ? 'track' : 'tracks'} · changed your mind?
+            </span>
+            <ChevronDown size={16} className={`transition-transform ${showSkipped ? 'rotate-180' : ''}`} />
+          </button>
+          {showSkipped && (
+            <ul className="mt-2">
+              {skipped.map((track) => (
+                <li key={track.id} className="flex items-center gap-4 border-b border-line py-3">
+                  <TrackRow track={track} />
+                  <button
+                    type="button"
+                    onClick={() => dispatch({ type: 'changeDecision', trackId: track.id, decision: 'keep' })}
+                    aria-label={`Keep ${track.name}`}
+                    className="grid size-8 shrink-0 place-items-center rounded-full text-muted transition-colors hover:bg-raised hover:text-champagne"
+                  >
+                    <Heart size={15} />
+                  </button>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+      )}
+
       <div className="sticky bottom-0 -mx-5 mt-6 bg-gradient-to-t from-ink via-ink to-transparent px-5 pt-6 pb-[max(1rem,env(safe-area-inset-bottom))]">
-        {error && <p className="mb-3 text-center text-xs text-red-300">{error}</p>}
+        {error && (
+          <p role="alert" className="mb-3 text-center text-xs text-red-300">
+            {partial
+              ? `Saved ${partial.added} of ${kept.length} tracks to “${partial.playlist.name}” before an error: ${error} Try again to add the rest.`
+              : error}
+          </p>
+        )}
         <button
           type="button"
           onClick={create}
@@ -200,9 +248,32 @@ export default function Results() {
           className="flex w-full items-center justify-center gap-2 rounded-full bg-champagne py-4 text-[15px] font-medium text-ink transition-colors hover:bg-cream disabled:opacity-40"
         >
           {creating && <Loader2 size={17} className="animate-spin" />}
-          {creating ? 'Creating playlist…' : 'Create playlist'}
+          {creating
+            ? partial
+              ? 'Adding tracks…'
+              : 'Creating playlist…'
+            : partial
+              ? `Add the remaining ${kept.length - partial.added} tracks`
+              : 'Create playlist'}
         </button>
       </div>
     </Screen>
+  )
+}
+
+function TrackRow({ track }: { track: Track }) {
+  return (
+    <>
+      <img
+        src={thumbnail(track)}
+        alt=""
+        loading="lazy"
+        className="size-12 shrink-0 rounded-lg border border-line object-cover"
+      />
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-[15px] text-cream">{track.name}</p>
+        <p className="truncate text-xs text-muted">{track.artists.map((a) => a.name).join(', ')}</p>
+      </div>
+    </>
   )
 }

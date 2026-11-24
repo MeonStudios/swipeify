@@ -12,6 +12,7 @@ import { TrackCardFace } from '../components/TrackCardFace'
 import { useTrackPlayback } from '../hooks/useTrackPlayback'
 import { musicService } from '../services'
 import {
+  canUndo,
   currentIndex,
   currentTrack,
   isComplete,
@@ -26,28 +27,30 @@ export default function Swipe() {
   const { playlistId } = useParams<{ playlistId: string }>()
   const navigate = useNavigate()
   const { state, dispatch } = useSwipeSession()
-  const [error, setError] = useState<string | null>(null)
-  /** 1 = keep (card flies right), -1 = skip (card flies left). */
+  // Tagged with the playlist they belong to, so switching playlists never shows a stale one.
+  const [loadError, setLoadError] = useState<{ playlistId: string; message: string } | null>(null)
+  /** 1 = keep (card flies right), -1 = skip (card flies left), 0 = undo (card fades in place). */
   const [exitDirection, setExitDirection] = useState(1)
   /**
-   * True only when the last swipe happened on this visit. Coming back from the
-   * results screen shows the static done card instead of auto-continuing again.
+   * True once the user swiped on this visit. Finishing then auto-continues to
+   * results; coming back from results shows the static done card instead.
    */
-  const [justFinished, setJustFinished] = useState(false)
-  const [progress, setProgress] = useState<{ loaded: number; total: number } | null>(null)
+  const [swipedThisVisit, setSwipedThisVisit] = useState(false)
+  const [loadProgress, setLoadProgress] = useState<{ playlistId: string; loaded: number; total: number } | null>(null)
 
   const ready = !!playlistId && state.playlist?.id === playlistId
+  const error = loadError && !ready && loadError.playlistId === playlistId ? loadError.message : null
+  const progress = loadProgress?.playlistId === playlistId ? loadProgress : null
 
   // Load the playlist unless this session is already running (e.g. back from results).
   useEffect(() => {
     if (!playlistId || ready) return
     let cancelled = false
-    setError(null)
-    setProgress(null)
+    const setError = (message: string) => !cancelled && setLoadError({ playlistId, message })
     Promise.all([
       musicService.getPlaylist(playlistId),
       musicService.getPlaylistTracks(playlistId, (loaded, total) => {
-        if (!cancelled) setProgress({ loaded, total })
+        if (!cancelled) setLoadProgress({ playlistId, loaded, total })
       }),
     ])
       .then(([playlist, tracks]) => {
@@ -63,7 +66,7 @@ export default function Swipe() {
             shuffleSeed: getShufflePreference() ? `${playlist.id}/${Date.now()}` : undefined,
           })
       })
-      .catch((e: unknown) => !cancelled && setError(e instanceof Error ? e.message : 'Something went wrong'))
+      .catch((e: unknown) => setError(e instanceof Error ? e.message : 'Something went wrong'))
     return () => {
       cancelled = true
     }
@@ -72,34 +75,46 @@ export default function Swipe() {
   const track = ready ? currentTrack(state) : null
   const peek = ready ? nextTrack(state) : null
   const complete = ready && isComplete(state)
+  const justFinished = complete && swipedThisVisit
   const { availability, isPlaying, positionMs, durationMs, unlock, toggle, replay } = useTrackPlayback(track)
 
   const decide = useCallback(
     (decision: Decision) => {
       if (!track) return
       setExitDirection(decision === 'keep' ? 1 : -1)
-      if (currentIndex(state) === state.tracks.length - 1) setJustFinished(true)
+      setSwipedThisVisit(true)
       unlock()
       dispatch({ type: 'decide', decision })
     },
-    [track, state, unlock, dispatch],
+    [track, unlock, dispatch],
   )
 
-  // Keyboard: ← skip, → keep, space play/pause.
+  const undoable = ready && canUndo(state)
+  const undo = useCallback(() => {
+    if (!undoable) return
+    setExitDirection(0)
+    unlock()
+    dispatch({ type: 'undo' })
+  }, [undoable, unlock, dispatch])
+
+  // Keyboard: ← skip, → keep, space play/pause, Z or Backspace undo.
   useEffect(() => {
     function onKeyDown(event: KeyboardEvent) {
       if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return
       if (event.metaKey || event.ctrlKey || event.altKey) return
-      if (event.key === 'ArrowLeft') decide('skip')
-      else if (event.key === 'ArrowRight') decide('keep')
-      else if (event.key === ' ') {
-        event.preventDefault()
-        if (!event.repeat) toggle()
-      } else return
+      const key = event.key.toLowerCase()
+      if (!['arrowleft', 'arrowright', ' ', 'z', 'backspace'].includes(key)) return
+      event.preventDefault()
+      // Holding a key must not decide (or undo) track after track.
+      if (event.repeat) return
+      if (key === 'arrowleft') decide('skip')
+      else if (key === 'arrowright') decide('keep')
+      else if (key === ' ') toggle()
+      else undo()
     }
     window.addEventListener('keydown', onKeyDown)
     return () => window.removeEventListener('keydown', onKeyDown)
-  }, [decide, toggle])
+  }, [decide, toggle, undo])
 
   const stats = sessionStats(state)
 
@@ -154,7 +169,7 @@ export default function Swipe() {
                 autoContinue={justFinished}
                 onReview={() => navigate('/results')}
                 onRestart={() => {
-                  setJustFinished(false)
+                  setSwipedThisVisit(false)
                   dispatch({ type: 'restart' })
                 }}
                 onChooseAnother={() => navigate('/playlists')}
@@ -191,9 +206,9 @@ export default function Swipe() {
                 onReplay={replay}
               />
             )}
-            <SwipeButtons onDecide={decide} disabled={complete} />
+            <SwipeButtons onDecide={decide} onUndo={undo} disabled={complete} undoDisabled={!undoable} />
             <p className="hidden text-center text-[11px] tracking-wide text-muted/70 sm:block">
-              ← skip · space play/pause · keep →
+              ← skip · space play/pause · Z undo · keep →
             </p>
           </div>
         </>

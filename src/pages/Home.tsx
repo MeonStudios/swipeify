@@ -141,6 +141,16 @@ function Permissions() {
         </ul>
         <p className="mt-3 text-center text-[11px] leading-relaxed text-muted/80">
           Everything stays in this browser. Swipeify has no server and never changes your existing playlists.
+          Logging out only signs this browser out; to revoke access completely, remove Swipeify at{' '}
+          <a
+            href="https://www.spotify.com/account/apps/"
+            target="_blank"
+            rel="noreferrer"
+            className="underline decoration-line underline-offset-2 hover:text-cream"
+          >
+            spotify.com/account/apps
+          </a>
+          .
         </p>
       </motion.div>
     </div>

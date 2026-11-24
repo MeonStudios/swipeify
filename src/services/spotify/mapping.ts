@@ -76,8 +76,14 @@ export function mapPlaylist(raw: RawPlaylist, currentUserId: string): Playlist {
     ownerName: own ? 'You' : (raw.owner.display_name ?? raw.owner.id),
     trackCount: raw.items?.total ?? raw.tracks?.total ?? 0,
     readable: own || !!raw.collaborative,
-    externalUrl: raw.external_urls?.spotify ?? `https://open.spotify.com/playlist/${raw.id}`,
+    externalUrl: spotifyLink(raw.external_urls?.spotify, `playlist/${raw.id}`),
   }
+}
+
+/** Links from the API end up in `href`s: only accept ones that point at open.spotify.com. */
+export function spotifyLink(url: string | undefined, fallbackPath: string): string {
+  if (url?.startsWith('https://open.spotify.com/')) return url
+  return `https://open.spotify.com/${fallbackPath.split('/').map(encodeURIComponent).join('/')}`
 }
 
 export function likedSongsPlaylist(trackCount: number): Playlist {
@@ -106,7 +112,7 @@ export function mapTrack(raw: RawTrack & { id: string }): Track {
       images: mapImages(raw.album?.images),
     },
     durationMs: raw.duration_ms,
-    externalUrl: raw.external_urls?.spotify ?? `https://open.spotify.com/track/${raw.id}`,
+    externalUrl: spotifyLink(raw.external_urls?.spotify, `track/${raw.id}`),
   }
 }
 

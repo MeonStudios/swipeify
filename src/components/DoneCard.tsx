@@ -1,5 +1,5 @@
 import { animate, motion, useMotionValue, useReducedMotion, useTransform } from 'motion/react'
-import { useEffect, useRef } from 'react'
+import { useEffect, useEffectEvent } from 'react'
 
 const ease = [0.22, 1, 0.36, 1] as const
 
@@ -89,13 +89,12 @@ function FinishSummary({ kept, total, onContinue }: { kept: number; total: numbe
   const count = useMotionValue(reduceMotion ? kept : 0)
   const rounded = useTransform(count, (v) => Math.round(v))
 
-  // Keep the latest callback without restarting the timer on every parent render.
-  const onContinueRef = useRef(onContinue)
-  onContinueRef.current = onContinue
+  // Calls the latest callback without restarting the timer on every parent render.
+  const continueNow = useEffectEvent(onContinue)
 
   useEffect(() => {
     const controls = reduceMotion ? null : animate(count, kept, { duration: COUNT_UP_S, delay: 0.3, ease })
-    const timer = setTimeout(() => onContinueRef.current(), AUTO_CONTINUE_MS)
+    const timer = setTimeout(() => continueNow(), AUTO_CONTINUE_MS)
     return () => {
       controls?.stop()
       clearTimeout(timer)

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest'
 import { LIKED_SONGS_ID } from '../../types/music'
+import { PlaylistSaveError } from '../musicService'
 import { createSpotifyClient } from './client'
 import { createSpotifyMusicService } from './spotifyMusicService'
 import { json, scriptedFetch } from './testUtils'
@@ -81,5 +82,30 @@ describe('spotify music service', () => {
     const batches = [1, 2, 3].map((i) => JSON.parse(String(http.call(i).body)).uris.length)
     expect(batches).toEqual([100, 100, 5])
     expect(http.call(1).url).toBe('https://api.spotify.com/v1/playlists/new/items')
+  })
+
+  it('reports how far it got when adding tracks fails, and resumes without a new playlist', async () => {
+    const uris = Array.from({ length: 205 }, (_, i) => `spotify:track:${i}`)
+    const { service, http } = setup(
+      json(201, { id: 'new', name: 'Fresh', external_urls: { spotify: 'https://open.spotify.com/playlist/new' } }),
+      json(201, { snapshot_id: '1' }),
+      json(500, { error: { message: 'boom' } }),
+      // The retry: only the missing batches, no second POST /me/playlists.
+      json(201, { snapshot_id: '2' }),
+      json(201, { snapshot_id: '3' }),
+    )
+
+    const error = await service.createPlaylist('Fresh', uris).catch((e: unknown) => e)
+    expect(error).toBeInstanceOf(PlaylistSaveError)
+    const { progress } = error as PlaylistSaveError
+    expect(progress).toMatchObject({ added: 100, playlist: { id: 'new', trackCount: 100 } })
+
+    const created = await service.createPlaylist('Fresh', uris, progress)
+    expect(created).toMatchObject({ id: 'new', trackCount: 205 })
+    expect(http.mock).toHaveBeenCalledTimes(5)
+    expect(http.call(3).url).toBe('https://api.spotify.com/v1/playlists/new/items')
+    const retried = [3, 4].map((i) => JSON.parse(String(http.call(i).body)).uris)
+    expect(retried[0][0]).toBe('spotify:track:100')
+    expect(retried.map((b) => b.length)).toEqual([100, 5])
   })
 })
