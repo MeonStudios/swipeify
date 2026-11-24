@@ -139,7 +139,18 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
   const initial: PlaybackSnapshot = { ...INITIAL, volume: clampVolume(config.initialVolume ?? DEFAULT_VOLUME) }
   let snapshot = initial
   const listeners = new Set<() => void>()
+  /**
+   * The tab's one SDK player, kept across disconnects: a second player in the
+   * same tab never becomes ready, so leaving a playlist and starting another
+   * must connect this one again instead of building a new one.
+   */
+  let instance: Spotify.Player | null = null
+  /** `instance` while it is connected (or connecting); null after `disconnect()`. */
   let player: Spotify.Player | null = null
+  /** Volume last sent to `instance`. */
+  let appliedVolume = 0
+  /** Fails a connect attempt that doesn't become ready in time. */
+  let readyTimer: ReturnType<typeof setTimeout> | null = null
   let deviceId: string | null = null
   let readyWaiters: { resolve: () => void; reject: (e: Error) => void }[] = []
 
@@ -175,7 +186,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     }, MUTE_TIMEOUT_MS)
     if (muted) return
     muted = true
-    player?.setVolume(0).catch(() => {})
+    applyVolume(0)
   }
 
   function unmute() {
@@ -183,7 +194,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     muteTimer = null
     if (!muted) return
     muted = false
-    player?.setVolume(snapshot.volume).catch(() => {})
+    applyVolume(snapshot.volume)
   }
 
   /** Pauses whatever is playing; only safe when no play request follows. */
@@ -210,13 +221,13 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     return new Promise((resolve, reject) => readyWaiters.push({ resolve, reject }))
   }
 
-  /** Drops the current player and connects a fresh one, keeping any pending request. */
+  /** Disconnects the player and connects it again, keeping any pending request. */
   function reconnect() {
     player?.disconnect()
     player = null
     deviceId = null
     loadedUri = null
-    // The new player starts at the normal volume.
+    // Nothing plays after reconnecting; the volume is restored once it's ready.
     muted = false
     update({ availability: 'connecting', isPlaying: false })
     void connect()
@@ -313,45 +324,41 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
     })
   }
 
-  async function connect() {
-    const myAttempt = ++attempt
-    const isCurrent = () => myAttempt === attempt
-    if (!isSupportedBrowser()) return fail('unsupported')
-    const timeout = setTimeout(() => {
-      if (isCurrent() && snapshot.availability === 'connecting') fail('unsupported')
-    }, READY_TIMEOUT_MS)
+  function clearReadyTimer() {
+    if (readyTimer) clearTimeout(readyTimer)
+    readyTimer = null
+  }
 
-    let PlayerClass: typeof Spotify.Player
-    try {
-      PlayerClass = await loadPlayerClass()
-    } catch {
-      clearTimeout(timeout)
-      if (isCurrent()) fail('error')
-      return
-    }
-    // A newer attempt or a disconnect happened while the SDK loaded (e.g. StrictMode's init → disconnect → init).
-    if (!isCurrent() || snapshot.availability !== 'connecting') return clearTimeout(timeout)
+  function applyVolume(volume: number) {
+    if (!player) return
+    appliedVolume = volume
+    player.setVolume(volume).catch(() => {})
+  }
 
-    const instance = new PlayerClass({
+  /** Builds the tab's one SDK player. Its events count only while it is the connected `player`. */
+  function createPlayer(PlayerClass: typeof Spotify.Player): Spotify.Player {
+    const created = new PlayerClass({
       name: 'Swipeify',
       volume: snapshot.volume,
       getOAuthToken: (callback) => {
         config.getAccessToken().then(callback, () => {
-          if (player === instance) fail('error')
+          if (player === created) fail('error')
         })
       },
     })
-    player = instance
-    /** Fails the current attempt, unless this instance has been replaced. */
-    const failIfCurrent = (availability: PlaybackAvailability) => {
-      clearTimeout(timeout)
-      if (player === instance) fail(availability)
+    appliedVolume = snapshot.volume
+    const failIfConnected = (availability: PlaybackAvailability) => {
+      if (player !== created) return
+      clearReadyTimer()
+      fail(availability)
     }
 
-    instance.addListener('ready', ({ device_id }) => {
-      if (player !== instance) return
-      clearTimeout(timeout)
+    created.addListener('ready', ({ device_id }) => {
+      if (player !== created) return
+      clearReadyTimer()
       deviceId = device_id
+      // The volume may have changed (or been left muted) while the player was disconnected.
+      if (!muted && appliedVolume !== snapshot.volume) applyVolume(snapshot.volume)
       update({ availability: 'ready' })
       const waiters = readyWaiters
       readyWaiters = []
@@ -359,23 +366,57 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
       // A request may have been parked while reconnecting.
       if (pending && !debounceTimer) void flush()
     })
-    instance.addListener('not_ready', () => {
+    created.addListener('not_ready', () => {
       // The SDK usually comes back by itself with a new device id; if not, start over.
-      if (player !== instance) return
+      if (player !== created) return
       deviceId = null
       update({ availability: 'connecting', isPlaying: false })
+      const myAttempt = attempt
       setTimeout(() => {
-        if (player === instance && snapshot.availability === 'connecting') reconnect()
+        if (myAttempt === attempt && player === created && snapshot.availability === 'connecting') reconnect()
       }, READY_TIMEOUT_MS)
     })
-    instance.addListener('initialization_error', () => failIfCurrent('unsupported'))
-    instance.addListener('account_error', () => failIfCurrent('premium-required'))
-    instance.addListener('authentication_error', () => failIfCurrent('error'))
-    instance.addListener('playback_error', (error) => console.warn('[playback]', error.message))
-    instance.addListener('player_state_changed', onStateChanged)
+    created.addListener('initialization_error', () => failIfConnected('unsupported'))
+    created.addListener('account_error', () => failIfConnected('premium-required'))
+    created.addListener('authentication_error', () => failIfConnected('error'))
+    created.addListener('playback_error', (error) => {
+      if (player === created) console.warn('[playback]', error.message)
+    })
+    created.addListener('player_state_changed', (state) => {
+      if (player === created) onStateChanged(state)
+    })
+    return created
+  }
 
+  async function connect() {
+    const myAttempt = ++attempt
+    const isCurrent = () => myAttempt === attempt
+    if (!isSupportedBrowser()) return fail('unsupported')
+    clearReadyTimer()
+    readyTimer = setTimeout(() => {
+      readyTimer = null
+      if (isCurrent() && snapshot.availability === 'connecting') fail('unsupported')
+    }, READY_TIMEOUT_MS)
+
+    let PlayerClass: typeof Spotify.Player
+    try {
+      PlayerClass = await loadPlayerClass()
+    } catch {
+      if (!isCurrent()) return
+      clearReadyTimer()
+      return fail('error')
+    }
+    // A newer attempt or a disconnect happened while the SDK loaded (e.g. StrictMode's init → disconnect → init).
+    if (!isCurrent() || snapshot.availability !== 'connecting') return
+
+    // Reuse the tab's player: a second one never becomes ready.
+    instance ??= createPlayer(PlayerClass)
+    player = instance
     const connected = await instance.connect()
-    if (!connected) failIfCurrent('unsupported')
+    if (!connected && isCurrent() && player === instance) {
+      clearReadyTimer()
+      fail('unsupported')
+    }
   }
 
   return {
@@ -431,7 +472,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
       if (next === snapshot.volume) return
       update({ volume: next })
       // While muted, the new volume applies once the next song is heard.
-      if (!muted) player?.setVolume(next).catch(() => {})
+      if (!muted) applyVolume(next)
     },
 
     pause() {
@@ -445,6 +486,7 @@ export function createPlaybackController(config: PlaybackConfig): PlaybackContro
       if (!player && snapshot.availability === 'idle' && snapshot.activeUri === null) return
       session++
       attempt++
+      clearReadyTimer()
       if (debounceTimer) clearTimeout(debounceTimer)
       debounceTimer = null
       player?.disconnect()

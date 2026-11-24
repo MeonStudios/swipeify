@@ -24,7 +24,9 @@ class FakePlayer {
   emit(event: string, arg: unknown) {
     this.listeners.get(event)?.(arg)
   }
+  connects = 0
   async connect() {
+    this.connects++
     if (FakePlayer.autoReady) queueMicrotask(() => this.emit('ready', { device_id: 'dev-1' }))
     return true
   }
@@ -178,6 +180,7 @@ describe('playback controller recovery', () => {
 
     await vi.advanceTimersByTimeAsync(DEVICE_RETRY_DELAYS_MS[0])
     expect(FakePlayer.last).toBe(first)
+    expect(first.connects).toBe(1)
     expect(playedUris()).toEqual(['spotify:track:a', 'spotify:track:a'])
     expect(controller.getSnapshot().availability).toBe('ready')
   })
@@ -187,18 +190,18 @@ describe('playback controller recovery', () => {
     const { controller, request } = await setup()
     const { SpotifyApiError } = await import('./client')
     request.mockRejectedValue(new SpotifyApiError(404, 'Device not found'))
-    const created = FakePlayer.created
+    const { connects } = FakePlayer.last
 
     controller.play('spotify:track:a', 1000)
     await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS + DEVICE_RETRY_DELAYS_MS.reduce((a, b) => a + b, 0))
 
-    expect(FakePlayer.created).toBe(created + 1)
+    expect(FakePlayer.last.connects).toBe(connects + 1)
     expect(request).toHaveBeenCalledTimes(DEVICE_RETRY_DELAYS_MS.length + 1)
     expect(controller.getSnapshot().availability).toBe('error')
 
     await vi.advanceTimersByTimeAsync(60_000)
     expect(request).toHaveBeenCalledTimes(DEVICE_RETRY_DELAYS_MS.length + 1)
-    expect(FakePlayer.created).toBe(created + 1)
+    expect(FakePlayer.last.connects).toBe(connects + 1)
   })
 
   it('a newer song requested during a retry wait is sent instead', async () => {
@@ -288,17 +291,44 @@ describe('playback controller release', () => {
   beforeEach(() => vi.useFakeTimers())
   afterEach(() => vi.useRealTimers())
 
-  it('disconnect releases the device and init connects a fresh player', async () => {
-    const { controller, player } = await setup()
+  it('disconnect releases the device and init connects the same player again', async () => {
+    const { controller, player, playedUris } = await setup()
     const disconnect = vi.spyOn(player, 'disconnect')
     controller.disconnect()
     expect(disconnect).toHaveBeenCalledTimes(1)
     expect(controller.getSnapshot().availability).toBe('idle')
 
+    // Leaving a playlist and starting another: a second SDK player in the tab would never work.
     controller.init()
     await vi.advanceTimersByTimeAsync(0)
-    expect(FakePlayer.last).not.toBe(player)
+    expect(FakePlayer.last).toBe(player)
+    expect(player.connects).toBe(2)
     expect(controller.getSnapshot().availability).toBe('ready')
+    controller.play('spotify:track:b', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    expect(playedUris()).toEqual(['spotify:track:b'])
+  })
+
+  it('restores the volume after leaving while the previous song was muted', async () => {
+    const { controller, player } = await setup()
+    controller.play('spotify:track:a', 0)
+    await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
+    player.emit('player_state_changed', state('spotify:track:a', 1000))
+    controller.play('spotify:track:b', 0) // mutes a
+    controller.disconnect()
+    controller.setVolume(0.5)
+
+    controller.init()
+    await vi.advanceTimersByTimeAsync(0)
+    expect(player.calls).toEqual(['volume:0', 'volume:0.5'])
+  })
+
+  it('ignores events from the player while it is disconnected', async () => {
+    const { controller, player } = await setup()
+    controller.disconnect()
+    player.emit('account_error', { message: 'late' })
+    player.emit('player_state_changed', state('spotify:track:a', 1000))
+    expect(controller.getSnapshot()).toMatchObject({ availability: 'idle', isPlaying: false })
   })
 })
 
@@ -380,17 +410,16 @@ describe('playback controller across disconnects', () => {
     expect(controller.getSnapshot().availability).toBe('ready')
   })
 
-  it('errors from a discarded player do not fail the current one', async () => {
+  it('builds only one SDK player per tab, however often it reconnects', async () => {
     const { controller } = createController()
-    controller.init()
-    await vi.advanceTimersByTimeAsync(0)
-    const old = FakePlayer.last
-    controller.disconnect()
-    controller.init()
-    await vi.advanceTimersByTimeAsync(0)
-
-    old.emit('account_error', { message: 'late' })
-    expect(controller.getSnapshot().availability).toBe('ready')
+    const before = FakePlayer.created
+    for (let i = 0; i < 3; i++) {
+      controller.init()
+      await vi.advanceTimersByTimeAsync(0)
+      expect(controller.getSnapshot().availability).toBe('ready')
+      controller.disconnect()
+    }
+    expect(FakePlayer.created - before).toBe(1)
   })
 
   it('a 404 that arrives after disconnect does not reconnect the player', async () => {
@@ -403,12 +432,12 @@ describe('playback controller across disconnects', () => {
 
     controller.play('spotify:track:a', 0)
     await vi.advanceTimersByTimeAsync(PLAY_DEBOUNCE_MS)
-    const created = FakePlayer.created
     controller.disconnect()
     rejectPlay(new SpotifyApiError(404, 'Device not found'))
-    await vi.advanceTimersByTimeAsync(0)
+    await vi.advanceTimersByTimeAsync(DEVICE_RETRY_DELAYS_MS[0])
 
-    expect(FakePlayer.created).toBe(created)
+    expect(FakePlayer.last.connects).toBe(1)
+    expect(request).toHaveBeenCalledTimes(1)
     expect(controller.getSnapshot().availability).toBe('idle')
   })
 })
@@ -436,7 +465,7 @@ describe('playback controller seek and volume', () => {
     expect((request.mock.calls[0][1] as { body: unknown }).body).toEqual({ uris: ['spotify:track:b'], position_ms: 90_000 })
   })
 
-  it('clamps the volume, applies it to the player and keeps it for the next player', async () => {
+  it('clamps the volume, applies it to the player and keeps it across reconnects', async () => {
     const { controller, player } = await setup()
     controller.setVolume(1.7)
     expect(player.calls).toEqual(['volume:1'])
@@ -447,7 +476,8 @@ describe('playback controller seek and volume', () => {
     expect(controller.getSnapshot().volume).toBe(0.25)
     controller.init()
     await vi.advanceTimersByTimeAsync(0)
-    expect(FakePlayer.last.init.volume).toBe(0.25)
+    // Already at 0.25, so reconnecting sends nothing more.
+    expect(player.calls).toEqual(['volume:1', 'volume:0.25'])
   })
 
   it('starts new players at the configured volume', async () => {
