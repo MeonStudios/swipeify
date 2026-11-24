@@ -2,7 +2,7 @@
 
 Tinder for Spotify playlists. Pick one of your playlists, hear each song, swipe right to keep it or left to drop it, and save the keepers as a new private playlist. Your original playlist is never changed.
 
-Built with React, Vite, Tailwind and TypeScript. Runs locally in your browser; there is no server.
+Built with React, Vite, Tailwind and TypeScript. Runs entirely in your browser; there is no server. Use it locally, or [host it on GitHub Pages](#deploying-to-github-pages) to open it from any desktop computer.
 
 ## What you need
 
@@ -60,12 +60,30 @@ npm run dev
 
 Open **http://127.0.0.1:5173**, not `localhost:5173`, and click **Connect Spotify**.
 
+## Deploying to GitHub Pages
+
+The CI workflow publishes the app to `https://<owner>.github.io/<repo>/` (for this repo: **https://meonstudios.github.io/swipeify/**) on every push to `main`, once lint, type-check, tests and build pass. You can also deploy by hand from **Actions → CI → Run workflow** on `main`. Pull requests are checked but never deployed.
+
+One-time setup:
+
+1. **Make the repo public**, or use a paid GitHub plan. GitHub Pages on the free plan only publishes public repos.
+2. In the repo, open **Settings → Pages** and set **Source** to **GitHub Actions**.
+3. Open **Settings → Secrets and variables → Actions → Variables** and add a repository variable named `VITE_SPOTIFY_CLIENT_ID` with your Client ID (step 3 above). It's a variable, not a secret: the Client ID ends up in the published page anyway, and that's fine.
+4. In the [Spotify Developer Dashboard](https://developer.spotify.com/dashboard), open your app's **Settings** and add a second **Redirect URI**: `https://meonstudios.github.io/swipeify/callback` (or `https://<owner>.github.io/<repo>/callback` for a fork). Keep `http://127.0.0.1:5173/callback` so local development keeps working.
+5. Push to `main` or run the workflow by hand. When it's done, the deploy job links to the site.
+
+Every Spotify account that logs in must still be on the app's user list (step 2 above). Logins are stored per browser, so each computer connects once.
+
+The deployed build is served from a subfolder: the workflow sets `BASE_PATH=/<repo>/`, which Vite uses as its base path. Without `BASE_PATH`, builds use `/`, as `npm run dev` and `npm run preview` do. GitHub Pages can't send unknown paths such as `/swipeify/callback` to the app, so the build also writes `404.html` as a copy of `index.html`, which Pages serves for those paths.
+
 ## Troubleshooting
 
 | What you see | What to do |
 | --- | --- |
 | Home screen says "Add `VITE_SPOTIFY_CLIENT_ID` to `.env.local`" | Check that `.env.local` exists in the project root (next to `package.json`) and contains `VITE_SPOTIFY_CLIENT_ID=…`. Then stop the dev server (Ctrl+C) and run `npm run dev` again; changes to `.env.local` are only picked up on start. |
 | Spotify shows **INVALID_CLIENT: Invalid redirect URI** | The redirect URI in your app settings must be exactly `http://127.0.0.1:5173/callback`, and you must open the app on `http://127.0.0.1:5173`, not `localhost`. |
+| **INVALID_CLIENT: Invalid redirect URI** on the GitHub Pages site | Add `https://meonstudios.github.io/swipeify/callback` to your app's Redirect URIs (see [Deploying to GitHub Pages](#deploying-to-github-pages), step 4). |
+| The deploy job fails with "Add the repository variable VITE_SPOTIFY_CLIENT_ID" | Add the variable (see [Deploying to GitHub Pages](#deploying-to-github-pages), step 3) and run the workflow again. |
 | Spotify shows **INVALID_CLIENT: Invalid client** | The Client ID in `.env.local` is wrong or has extra characters. Copy it again and restart the dev server. |
 | "Spotify refused this request…" / "user not registered" | Your Spotify account isn't on the app's user list. See step 2; use the email of the account you log in with. |
 | "Port 5173 is in use" | Another program (maybe a second `npm run dev`) is using the port. Close it; Swipeify needs exactly port 5173 because that's in the redirect URI. |
@@ -94,7 +112,7 @@ Local files, podcast episodes, songs unavailable in your country and duplicates 
 | `npm run typecheck` | Type-check without building                    |
 | `npm run check`     | Lint, type-check and test, as CI does          |
 
-CI (GitHub Actions) runs lint, type-check, tests and build on every push to `main` and on pull requests.
+CI (GitHub Actions) runs lint, type-check, tests and build on every push to `main` and on pull requests, then deploys `main` to GitHub Pages (see [Deploying to GitHub Pages](#deploying-to-github-pages)).
 
 The project lints with oxlint instead of ESLint because typescript-eslint doesn't support TypeScript 7 yet.
 

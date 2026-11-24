@@ -10,7 +10,9 @@ import { getVolumePreference } from '../state/preferences'
 export const spotifyClientId = import.meta.env.VITE_SPOTIFY_CLIENT_ID?.trim() ?? ''
 
 // Spotify only accepts loopback IPs (not `localhost`) as http redirect URIs.
-const redirectUri = import.meta.env.VITE_SPOTIFY_REDIRECT_URI?.trim() || `${window.location.origin}/callback`
+// BASE_URL is `/` locally and `/swipeify/` on GitHub Pages.
+const redirectUri =
+  import.meta.env.VITE_SPOTIFY_REDIRECT_URI?.trim() || `${window.location.origin}${import.meta.env.BASE_URL}callback`
 
 const fetchFn: typeof fetch = (...args) => window.fetch(...args)
 

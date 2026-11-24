@@ -4,6 +4,8 @@ on:
   push:
     branches: [main]
   pull_request:
+  # The "Run workflow" button: checks and deploys the chosen branch (use main).
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,3 +29,43 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run build
+
+  # Publishes to https://meonstudios.github.io/swipeify/ after the checks pass.
+  # Needs Settings → Pages → Source set to "GitHub Actions" and the repository
+  # variable VITE_SPOTIFY_CLIENT_ID (see README → Deploying to GitHub Pages).
+  deploy:
+    needs: check
+    if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    concurrency:
+      group: pages
+      cancel-in-progress: false
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - run: npm ci
+      - name: Check the Spotify client ID is set
+        if: vars.VITE_SPOTIFY_CLIENT_ID == ''
+        run: |
+          echo "::error::Add the repository variable VITE_SPOTIFY_CLIENT_ID (Settings → Secrets and variables → Actions → Variables)."
+          exit 1
+      - run: npm run build
+        env:
+          VITE_SPOTIFY_CLIENT_ID: ${{ vars.VITE_SPOTIFY_CLIENT_ID }}
+          BASE_PATH: /${{ github.event.repository.name }}/
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deployment
+        uses: actions/deploy-pages@v4

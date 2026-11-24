@@ -1,5 +1,5 @@
 /// <reference types="vitest/config" />
-import { defineConfig, type Plugin } from 'vite'
+import { defineConfig, loadEnv, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
 import tailwindcss from '@tailwindcss/vite'
 
@@ -54,13 +54,39 @@ function contentSecurityPolicy(): Plugin {
   }
 }
 
+/**
+ * GitHub Pages has no fallback to index.html, so `/callback` (where Spotify
+ * sends the user after login) and refreshes on other screens would show
+ * GitHub's 404 page. Pages serves `404.html` for unknown paths, so make it a
+ * copy of the app.
+ */
+function spaFallback(): Plugin {
+  return {
+    name: 'swipeify-spa-fallback',
+    apply: 'build',
+    // After Vite has emitted index.html (and the CSP tag is in it).
+    enforce: 'post',
+    generateBundle: {
+      order: 'post',
+      handler(_options, bundle) {
+        const index = bundle['index.html']
+        if (index?.type !== 'asset') this.error('index.html missing from the bundle')
+        this.emitFile({ type: 'asset', fileName: '404.html', source: index.source })
+      },
+    },
+  }
+}
+
 async function sha256(text: string): Promise<string> {
   const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(text))
   return btoa(String.fromCharCode(...new Uint8Array(digest)))
 }
 
-export default defineConfig({
-  plugins: [react(), tailwindcss(), contentSecurityPolicy()],
+export default defineConfig(({ mode }) => ({
+  // The path the app is served under: `/` locally, `/swipeify/` on GitHub Pages
+  // (the deploy workflow sets BASE_PATH).
+  base: loadEnv(mode, '.', 'BASE_PATH').BASE_PATH || '/',
+  plugins: [react(), tailwindcss(), contentSecurityPolicy(), spaFallback()],
   // Spotify requires a loopback IP (not `localhost`) in http redirect URIs, and the
   // registered redirect URI includes the port, so it must not drift.
   server: { host: HOST, port: PORT, strictPort: true },
@@ -68,4 +94,4 @@ export default defineConfig({
   test: {
     environment: 'node',
   },
-})
+}))
